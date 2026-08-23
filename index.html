@@ -241,7 +241,7 @@ function parseAIJson(text){
 // CARA AKTIFKAN MODE LINTAS PERANGKAT:
 // Deploy backend (lihat file Code.gs yang disertakan terpisah) sebagai Google Apps Script
 // Web App, lalu tempel URL hasil deploy-nya (diakhiri /exec) di baris di bawah ini.
-const GAS_WEBAPP_URL = ''; // <-- tempel URL Web App Apps Script Anda di sini, lalu simpan ulang file ini
+const GAS_WEBAPP_URL = 'https://script.google.com/macros/s/AKfycbyrjprz4ytu_mmby1pK5sqsP6Uypd6KoM9q9ZdpG253ZiplKezW9_mtXe8ABgRV6hvf/exec';
 
 const LS_PREFIX = 'simkin_rs_';
 const STORAGE_MODE = GAS_WEBAPP_URL ? 'gas'
@@ -332,6 +332,10 @@ let state = {
   adminAuthed: false, // status login admin pada sesi ini (di memori)
   adminLoginError: null,
   adminPinEditing: false,
+  superAdminPin: '', // PIN kedua khusus untuk membuka menu Pengaturan Bobot (kosong = belum diaktifkan)
+  superAdminAuthed: false,
+  superAdminLoginError: null,
+  superAdminPinEditing: false,
   geofence: { lat:null, lng:null, radius:200 }, // titik referensi RS + radius (meter) untuk absen GPS
   shiftConfig: { jamMulai:'07:00', toleransiMenit:15 }, // jam mulai kerja & toleransi keterlambatan untuk hitung "terlambat"
   myPegawaiId: null, // identitas pegawai pemilik perangkat ini (mode Absen Mandiri) — disimpan lokal per perangkat
@@ -419,7 +423,7 @@ async function loadAll(){
 
   try{
     const sec = await Storage.get('admin-security', true);
-    if(sec){ const parsed = JSON.parse(sec.value); state.adminPin = parsed.pin || ''; }
+    if(sec){ const parsed = JSON.parse(sec.value); state.adminPin = parsed.pin || ''; state.superAdminPin = parsed.superPin || ''; }
   }catch(e){}
 
   try{
@@ -472,7 +476,7 @@ async function saveSikapThresholds(){
   await Storage.set('sikap-thresholds', JSON.stringify(state.sikapThresholds), true);
 }
 async function saveAdminSecurity(){
-  await Storage.set('admin-security', JSON.stringify({pin: state.adminPin}), true);
+  await Storage.set('admin-security', JSON.stringify({pin: state.adminPin, superPin: state.superAdminPin}), true);
 }
 async function saveAbsensiConfig(){
   await Storage.set('absensi-config', JSON.stringify({geofence: state.geofence, shiftConfig: state.shiftConfig}), true);
@@ -794,6 +798,14 @@ async function render(){
       }},['Keluar'])
     ]));
   }
+  if(state.role==='admin' && state.superAdminPin && state.superAdminAuthed){
+    roleBox.appendChild(el('div',{style:'margin-top:6px;display:flex;justify-content:space-between;align-items:center;'},[
+      el('span',{style:'font-size:10.5px;color:#F4B3AD;'},['🛡️ Super Admin login']),
+      el('button',{class:'btn btn-outline btn-sm',style:'background:transparent;border-color:rgba(255,255,255,0.25);color:#DCEAE7;padding:3px 8px;font-size:10.5px;', onclick:()=>{
+        state.superAdminAuthed = false; rerender();
+      }},['Keluar'])
+    ]));
+  }
   sidebar.appendChild(roleBox);
 
   if(state.role==='unit' || state.role==='admin'){
@@ -895,6 +907,8 @@ async function render(){
     renderUnitLogin(body);
   } else if(state.role==='admin' && state.adminPin && !state.adminAuthed){
     renderAdminLogin(body);
+  } else if(state.role==='admin' && state.tab==='pengaturan' && state.superAdminPin && !state.superAdminAuthed){
+    renderSuperAdminLogin(body);
   } else {
     await renderTab(body);
   }
@@ -1129,6 +1143,28 @@ function renderAdminLogin(body){
   pinInp.addEventListener('keydown', e=>{ if(e.key==='Enter') doLogin(); });
   const btnRow = el('div',{style:'margin-top:14px;'});
   btnRow.appendChild(el('button',{class:'btn btn-gold',style:'width:100%;padding:10px;', onclick:doLogin},['Masuk']));
+  panel.appendChild(btnRow);
+  body.appendChild(panel);
+}
+
+function renderSuperAdminLogin(body){
+  const panel = el('div',{class:'panel',style:'max-width:380px;margin:40px auto;border-color:var(--red);'});
+  panel.appendChild(el('h3',{style:'margin-bottom:4px;color:var(--red);'},['🛡️ Verifikasi Super Admin']));
+  panel.appendChild(el('div',{class:'small-note',style:'margin:10px 0;'},['Menu Pengaturan Bobot berisi konfigurasi yang memengaruhi langsung perhitungan tukin (bobot penilaian, ambang batas Sikap Kerja, lokasi GPS, dan PIN Admin). Masukkan PIN Super Admin untuk melanjutkan.']));
+  const pinInp = el('input',{type:'password',inputmode:'numeric',placeholder:'PIN Super Admin',style:'width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:8px;font-size:14px;letter-spacing:2px;'});
+  panel.appendChild(pinInp);
+  if(state.superAdminLoginError) panel.appendChild(el('div',{class:'warn-note',style:'margin-top:10px;'},[state.superAdminLoginError]));
+  const doLogin = ()=>{
+    if(pinInp.value === state.superAdminPin){
+      state.superAdminAuthed = true; state.superAdminLoginError = null; rerender();
+    } else {
+      state.superAdminLoginError = 'PIN salah. Coba lagi.'; rerender();
+    }
+  };
+  pinInp.addEventListener('keydown', e=>{ if(e.key==='Enter') doLogin(); });
+  const btnRow = el('div',{style:'margin-top:14px;display:flex;gap:8px;'});
+  btnRow.appendChild(el('button',{class:'btn btn-outline',style:'flex:1;padding:10px;', onclick:()=>{ state.tab='dashboard'; rerender(); }},['Batal']));
+  btnRow.appendChild(el('button',{class:'btn btn-red',style:'flex:2;padding:10px;background:var(--red);color:#fff;', onclick:doLogin},['Masuk']));
   panel.appendChild(btnRow);
   body.appendChild(panel);
 }
@@ -1828,6 +1864,51 @@ function renderPengaturan(body){
     panelPin.appendChild(btnRow);
   }
   body.appendChild(panelPin);
+
+  /* Keamanan Super Admin — PIN kedua khusus halaman Pengaturan */
+  const panelSuper = el('div',{class:'panel',style:'border-color:var(--red);'});
+  panelSuper.appendChild(el('h3',{style:'color:var(--red);'},['🛡️ Keamanan Super Admin']));
+  panelSuper.appendChild(el('div',{class:'small-note',style:'margin-bottom:12px;'},['Lapisan proteksi kedua khusus untuk membuka halaman Pengaturan Bobot ini (terpisah dari PIN Admin biasa). Berguna kalau Bapak ingin memisahkan siapa yang boleh mengakses menu harian dari siapa yang boleh mengubah bobot/tukin.']));
+  if(state.superAdminPin){
+    panelSuper.appendChild(el('div',{style:'background:var(--red-soft);color:var(--red);padding:8px 12px;border-radius:8px;font-size:12px;font-weight:600;margin-bottom:12px;'},['✓ PIN Super Admin aktif — halaman Pengaturan Bobot diproteksi ganda.']));
+  } else {
+    panelSuper.appendChild(el('div',{class:'warn-note',style:'margin-bottom:12px;'},['PIN Super Admin belum diatur — siapa pun yang punya PIN Admin biasa bisa langsung membuka halaman ini.']));
+  }
+
+  if(state.superAdminPinEditing){
+    const oldInp = state.superAdminPin ? el('input',{type:'password',placeholder:'PIN Super Admin saat ini',style:'padding:8px 10px;border:1px solid var(--line);border-radius:7px;'}) : null;
+    const newInp = el('input',{type:'password',placeholder:'PIN baru (angka, min. 4 digit)',style:'padding:8px 10px;border:1px solid var(--line);border-radius:7px;'});
+    const confInp = el('input',{type:'password',placeholder:'Ulangi PIN baru',style:'padding:8px 10px;border:1px solid var(--line);border-radius:7px;'});
+    const row = el('div',{style:'display:flex;gap:8px;flex-wrap:wrap;align-items:center;'});
+    if(oldInp) row.appendChild(oldInp);
+    row.appendChild(newInp); row.appendChild(confInp);
+    const saveBtn = el('button',{class:'btn btn-sm',style:'background:var(--red);color:#fff;', onclick:()=>{
+      if(state.superAdminPin && oldInp.value !== state.superAdminPin){ alert('PIN Super Admin saat ini salah.'); return; }
+      if(newInp.value.length<4){ alert('PIN baru minimal 4 digit.'); return; }
+      if(newInp.value !== confInp.value){ alert('Konfirmasi PIN tidak cocok.'); return; }
+      state.superAdminPin = newInp.value;
+      state.superAdminAuthed = true;
+      state.superAdminPinEditing = false;
+      rerender();
+      bgSave(saveAdminSecurity());
+    }},[state.superAdminPin ? 'Simpan PIN Baru' : 'Aktifkan PIN Super Admin']);
+    const cancelBtn = el('button',{class:'btn btn-outline btn-sm', onclick:()=>{ state.superAdminPinEditing=false; rerender(); }},['Batal']);
+    row.appendChild(saveBtn); row.appendChild(cancelBtn);
+    panelSuper.appendChild(row);
+  } else {
+    const btnRow2 = el('div',{style:'display:flex;gap:8px;'});
+    btnRow2.appendChild(el('button',{class:'btn btn-sm',style:'background:var(--red);color:#fff;', onclick:()=>{ state.superAdminPinEditing=true; rerender(); }},[state.superAdminPin?'Ubah PIN Super Admin':'Aktifkan PIN Super Admin']));
+    if(state.superAdminPin){
+      btnRow2.appendChild(el('button',{class:'btn btn-outline btn-sm', onclick:()=>{
+        const check = prompt('Masukkan PIN Super Admin saat ini untuk menonaktifkan proteksi:');
+        if(check===null) return;
+        if(check !== state.superAdminPin){ alert('PIN salah.'); return; }
+        state.superAdminPin = ''; rerender(); bgSave(saveAdminSecurity());
+      }},['Nonaktifkan PIN']));
+    }
+    panelSuper.appendChild(btnRow2);
+  }
+  body.appendChild(panelSuper);
 
   /* Ambang Batas Sikap Kerja (aspek otomatis) */
   const panelTh = el('div',{class:'panel'});
