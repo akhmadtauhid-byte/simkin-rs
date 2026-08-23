@@ -256,6 +256,41 @@ async function gasFetch(params, isPost, body){
   return await res.json();
 }
 
+/** Diagnostik manual: kirim & ambil data uji ke server, tampilkan setiap langkah apa adanya
+ * (status HTTP, balasan mentah) supaya kegagalan bisa dilihat persis di layar tanpa perlu DevTools. */
+async function testGasConnection(){
+  const log = [];
+  const testKey = 'diag-test-'+Date.now();
+  const testVal = 'ok-'+Date.now();
+  if(!GAS_WEBAPP_URL){ log.push('❌ GAS_WEBAPP_URL masih kosong di dalam file.'); return log; }
+  try{
+    log.push('1) Mengirim data uji ke server (POST)…');
+    const setRes = await fetch(GAS_WEBAPP_URL, {method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify({action:'set', key:testKey, value:testVal})});
+    log.push('   Status HTTP: '+setRes.status+' '+setRes.statusText);
+    const setText = await setRes.text();
+    log.push('   Balasan mentah: '+setText.slice(0,300));
+    let setJson=null; try{ setJson = JSON.parse(setText); }catch(e){ log.push('   ⚠️ Balasan BUKAN JSON valid — kemungkinan server mengirim halaman HTML/login, bukan hasil kode Apps Script.'); }
+    if(setJson && setJson.ok){ log.push('   ✓ Server mengonfirmasi data tersimpan.'); }
+    else if(setJson && setJson.error){ log.push('   ⚠️ Server membalas pesan error: '+setJson.error); }
+
+    log.push('2) Mengambil kembali data uji dari server (GET)…');
+    const getRes = await fetch(GAS_WEBAPP_URL+'?action=get&key='+encodeURIComponent(testKey));
+    log.push('   Status HTTP: '+getRes.status+' '+getRes.statusText);
+    const getText = await getRes.text();
+    log.push('   Balasan mentah: '+getText.slice(0,300));
+    let getJson=null; try{ getJson = JSON.parse(getText); }catch(e){ log.push('   ⚠️ Balasan BUKAN JSON valid.'); }
+    if(getJson && getJson.value===testVal){ log.push('   ✅ COCOK — data berhasil bolak-balik ke server. Koneksi berfungsi normal!'); }
+    else if(getJson){ log.push('   ⚠️ TIDAK COCOK. Diharapkan "'+testVal+'", server mengembalikan: '+JSON.stringify(getJson.value)); }
+
+    fetch(GAS_WEBAPP_URL, {method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify({action:'delete', key:testKey})}).catch(()=>{});
+    log.push('3) Data uji dibersihkan dari server.');
+  }catch(e){
+    log.push('❌ ERROR JARINGAN saat menghubungi server: '+(e.message||e));
+    log.push('   Ini biasanya berarti permintaan diblokir kebijakan browser (CORS), koneksi internet terputus, atau alamat GAS_WEBAPP_URL salah/sudah tidak aktif.');
+  }
+  return log;
+}
+
 const Storage = {
   async get(key, shared){
     if(STORAGE_MODE==='gas'){
@@ -352,6 +387,8 @@ let state = {
   aiError: null,
   aiPdfPegawai: null, // {base64, name}
   aiPdfBulanan: null, // {base64, name}
+  diagLog: null,
+  diagBusy: false,
   absenManageOpen: false,
   pinSetupOpen: false,
   unitAuth: {}, // {unitId: true} - status login unit pada sesi ini (di memori, reset saat halaman dimuat ulang)
@@ -1780,6 +1817,28 @@ function renderRekap(body){
 
 /* ============ PENGATURAN BOBOT ============ */
 function renderPengaturan(body){
+  /* Diagnostik Koneksi Server */
+  if(STORAGE_MODE==='gas'){
+    const panelDiag = el('div',{class:'panel',style:'border-color:var(--gold);'});
+    panelDiag.appendChild(el('h3',null,['🔌 Tes Koneksi Server']));
+    panelDiag.appendChild(el('div',{class:'small-note',style:'margin-bottom:12px;'},['Kirim data uji ke server Google Apps Script lalu ambil kembali, untuk memastikan data benar-benar tersimpan bersama (bukan cuma tersimpan lokal di perangkat ini).']));
+    const diagBtn = el('button',{class:'btn btn-gold', disabled: state.diagBusy, onclick: async ()=>{
+      state.diagBusy = true; state.diagLog = null; rerender();
+      const log = await testGasConnection();
+      state.diagBusy = false; state.diagLog = log; rerender();
+    }},[state.diagBusy?'Menguji…':'Jalankan Tes Koneksi']);
+    panelDiag.appendChild(diagBtn);
+    if(state.diagLog){
+      const box = el('div',{style:'margin-top:12px;background:#0B1E1C;color:#DCEAE7;border-radius:9px;padding:12px 14px;font-family:monospace;font-size:11.5px;white-space:pre-wrap;line-height:1.6;max-height:340px;overflow-y:auto;'});
+      state.diagLog.forEach(line=>{
+        const color = line.includes('✅')||line.includes('✓') ? '#8FE0B0' : (line.includes('⚠️')||line.includes('❌') ? '#F4B3AD' : '#DCEAE7');
+        box.appendChild(el('div',{style:'color:'+color+';'},[line]));
+      });
+      panelDiag.appendChild(box);
+    }
+    body.appendChild(panelDiag);
+  }
+
   /* Lokasi RS (Geofence) & Jadwal Kerja untuk Absen Mandiri */
   const panelGeo = el('div',{class:'panel'});
   panelGeo.appendChild(el('h3',null,['📍 Lokasi RS & Jadwal Kerja (untuk Absen Mandiri)']));
