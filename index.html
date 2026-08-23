@@ -6,6 +6,7 @@
 <title>SIMKIN-RS | Sistem Penilaian Kinerja &amp; Tukin</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Lexend:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <style>
 :root{
   --ink:#152524;
@@ -874,7 +875,7 @@ async function render(){
     unit:[['dashboard','◆','Dashboard'],['input','◆','Input Penilaian'],['input_ai','✨','Input Bulanan (AI)']],
     hrd:[['dashboard','◆','Dashboard'],['validasi_hrd','◆','Validasi Sikap Kerja'],['pegawai','◆','Data Pegawai']],
     diklat:[['dashboard','◆','Dashboard'],['validasi_diklat','◆','Validasi Kinerja & Mutu']],
-    admin:[['dashboard','◆','Dashboard'],['unit_master','◆','Data Unit'],['pegawai','◆','Data Pegawai'],['pegawai_ai','✨','Input Pegawai (AI)'],['aspek_master','◆','Aspek Penilaian'],['input','◆','Input Penilaian'],['input_ai','✨','Input Bulanan (AI)'],['validasi_hrd','◆','Validasi Sikap Kerja'],['validasi_diklat','◆','Validasi Kinerja & Mutu'],['rekap','◆','Rekap & Tukin'],['pengaturan','◆','Pengaturan Bobot']],
+    admin:[['dashboard','◆','Dashboard'],['unit_master','◆','Data Unit'],['pegawai','◆','Data Pegawai'],['pegawai_ai','📊','Input Massal Pegawai'],['aspek_master','◆','Aspek Penilaian'],['input','◆','Input Penilaian'],['input_ai','✨','Input Bulanan (AI)'],['validasi_hrd','◆','Validasi Sikap Kerja'],['validasi_diklat','◆','Validasi Kinerja & Mutu'],['rekap','◆','Rekap & Tukin'],['pengaturan','◆','Pengaturan Bobot']],
   };
   const navRoleKey = state.role==='pegawai' ? 'pegawai_self' : state.role;
   const nav = el('div',{class:'nav'});
@@ -896,7 +897,7 @@ async function render(){
     unit_master:['Data Unit','Kelola daftar unit/ruangan rumah sakit'],
     input:['Input Penilaian','Sikap Kerja (absensi), Kinerja Pelayanan & Mutu Pelayanan — Unit '+unitName(state.currentUnitId)],
     input_ai:['Input Bulanan (AI)','Tempel catatan/laporan bulanan unit, AI bantu susun skor awal — Unit '+unitName(state.currentUnitId)],
-    pegawai_ai:['Input Pegawai (AI)','Tempel data pegawai dari sumber manapun, AI bantu merapikan ke format sistem'],
+    pegawai_ai:['Input Massal Pegawai','Upload Excel untuk data besar (instan), atau tempel teks bebas dibantu AI'],
     aspek_master:['Aspek Penilaian','Sesuaikan daftar aspek penilaian dengan regulasi/akreditasi rumah sakit (KARS, dsb)'],
     absen:['Absen Mandiri','Verifikasi lokasi & sidik jari untuk absen masuk/pulang'],
     validasi_hrd:['Validasi HRD','Verifikasi data Sikap Kerja berbasis absensi'],
@@ -1392,14 +1393,67 @@ function renderPegawai(body){
 }
 
 /* ============ AI: INPUT PEGAWAI MASSAL ============ */
+/* ============ IMPOR EXCEL (tanpa AI — instan untuk data terstruktur) ============ */
+function parseExcelPegawai(arrayBuffer){
+  const wb = XLSX.read(arrayBuffer, {type:'array'});
+  const sheet = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(sheet, {header:1, defval:''});
+  let headerIdx = -1;
+  for(let i=0;i<Math.min(rows.length,10);i++){
+    if(rows[i].some(c=>String(c).trim().toLowerCase()==='nama')){ headerIdx = i; break; }
+  }
+  if(headerIdx===-1) headerIdx = 0;
+  const header = rows[headerIdx].map(h=>String(h).trim().toLowerCase());
+  const idxNama = header.findIndex(h=>h.includes('nama'));
+  const idxUnit = header.findIndex(h=>h.includes('unit'));
+  const idxJabatan = header.findIndex(h=>h.includes('jabatan'));
+  const idxTukin = header.findIndex(h=>h.includes('tukin'));
+  const result = [];
+  for(let i=headerIdx+1;i<rows.length;i++){
+    const row = rows[i];
+    const nama = idxNama>=0 ? String(row[idxNama]||'').trim() : '';
+    if(!nama) continue;
+    result.push({
+      nama,
+      unit: idxUnit>=0 ? String(row[idxUnit]||'').trim() : '',
+      jabatan: idxJabatan>=0 ? String(row[idxJabatan]||'').trim() : '',
+      tukin: idxTukin>=0 ? (Number(row[idxTukin])||0) : 0,
+    });
+  }
+  return result;
+}
+
 function renderPegawaiAI(body){
   if(state.units.length===0){
     body.appendChild(el('div',{class:'panel'},[el('div',{class:'empty'},['Tambahkan minimal satu unit terlebih dahulu di menu "Data Unit" sebelum menggunakan input AI.'])]));
     return;
   }
+
+  /* Panel Impor Excel — jalur tercepat untuk data besar (mis. 350 pegawai), tanpa AI */
+  const panelExcel = el('div',{class:'panel',style:'border-color:var(--teal);'});
+  panelExcel.appendChild(el('h3',null,['📊 Impor Massal dari Template Excel']));
+  panelExcel.appendChild(el('div',{class:'small-note'},['Cara tercepat untuk data banyak (ratusan pegawai) — dibaca langsung tanpa AI, jadi instan dan hasilnya pasti sama persis dengan yang diketik di Excel. Unduh template, isi kolom Nama/Unit/Jabatan/Tukin, lalu unggah kembali di sini.']));
+  const excelBtnRow = el('div',{style:'display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap;'});
+  const excelInput = el('input',{type:'file',accept:'.xlsx,.xls',id:'excelPegawaiInput',style:'display:none;'});
+  excelInput.addEventListener('change', async (e)=>{
+    const f = e.target.files[0]; if(!f) return;
+    try{
+      const buf = await f.arrayBuffer();
+      const rows = parseExcelPegawai(buf);
+      if(rows.length===0){ alert('Tidak ada baris data yang terbaca. Pastikan kolom "Nama" terisi dan mengikuti format template.'); return; }
+      state.aiImportPreview = rows.map(r=>({nama:r.nama, unit:r.unit, jabatan:r.jabatan, tukin:r.tukin}));
+      rerender();
+    }catch(err){ alert('Gagal membaca file Excel: '+(err.message||err)); }
+    e.target.value = '';
+  });
+  const excelLabel = el('label',{for:'excelPegawaiInput',class:'btn btn-primary',style:'cursor:pointer;'},['📤 Unggah File Excel']);
+  excelBtnRow.appendChild(excelInput); excelBtnRow.appendChild(excelLabel);
+  panelExcel.appendChild(excelBtnRow);
+  body.appendChild(panelExcel);
+
   const panel = el('div',{class:'panel'});
-  panel.appendChild(el('h3',null,['Tempel Data Pegawai']));
-  panel.appendChild(el('div',{class:'small-note'},['Tempel data pegawai dalam format apa saja — daftar dari Excel, tabel Word, atau ketikan bebas seperti "Budi Santoso, Perawat, Rawat Inap". Atau unggah file PDF (misalnya daftar pegawai/SK). AI akan mengenali nama, unit, dan jabatan secara otomatis. Nama unit akan dicocokkan dengan unit yang sudah terdaftar; jika tidak ditemukan, unit baru akan diusulkan.']));
+  panel.appendChild(el('h3',null,['Atau: Tempel Data Pegawai (dengan bantuan AI)']));
+  panel.appendChild(el('div',{class:'small-note'},['Untuk data tidak rapi/bebas format — daftar dari WA, tabel Word, atau ketikan bebas seperti "Budi Santoso, Perawat, Rawat Inap". Atau unggah file PDF (misalnya daftar pegawai/SK). AI akan mengenali nama, unit, dan jabatan secara otomatis. Nama unit akan dicocokkan dengan unit yang sudah terdaftar; jika tidak ditemukan, unit baru akan diusulkan.']));
   const ta = el('textarea',{rows:'9',style:'width:100%;margin-top:10px;font-family:monospace;font-size:12.5px;',placeholder:'Contoh:\nBudi Santoso - Perawat - Rawat Inap\nSiti Aminah, Bidan, VK\nAgus Wibowo (Analis Lab) unit Laboratorium'});
   panel.appendChild(ta);
 
@@ -1428,7 +1482,7 @@ function renderPegawaiAI(body){
       const content = buildAIContent(ta.value.trim(), state.aiPdfPegawai);
       const out = await callClaudeAI(sys, content);
       const arr = parseAIJson(out);
-      state.aiImportPreview = arr.map(x=>({nama:x.n||'', unit:x.u||'', jabatan:x.j||''}));
+      state.aiImportPreview = arr.map(x=>({nama:x.n||'', unit:x.u||'', jabatan:x.j||'', tukin:0}));
     }catch(e){
       state.aiError = e.message || 'Gagal memproses dengan AI.';
     }
@@ -1442,10 +1496,10 @@ function renderPegawaiAI(body){
 
   if(state.aiImportPreview && state.aiImportPreview.length>0){
     const prevPanel = el('div',{class:'panel'});
-    prevPanel.appendChild(el('h3',null,['Pratinjau Hasil AI ',el('span',{class:'n'},['('+state.aiImportPreview.length+' pegawai)'])]));
+    prevPanel.appendChild(el('h3',null,['Pratinjau Data ',el('span',{class:'n'},['('+state.aiImportPreview.length+' pegawai)'])]));
     prevPanel.appendChild(el('div',{class:'small-note'},['Periksa dan sunting jika perlu sebelum disimpan. Unit yang belum terdaftar akan otomatis dibuat.']));
     const table = el('table');
-    table.appendChild(el('tr',null,[el('th',null,['Nama']),el('th',null,['Unit']),el('th',null,['Jabatan']),el('th',null,[''])]));
+    table.appendChild(el('tr',null,[el('th',null,['Nama']),el('th',null,['Unit']),el('th',null,['Jabatan']),el('th',null,['Tukin Maks (Rp)']),el('th',null,[''])]));
     state.aiImportPreview.forEach((row,i)=>{
       const namaInp = el('input',{value:row.nama,style:'width:100%;border:1px solid var(--line);border-radius:6px;padding:5px 7px;'});
       namaInp.addEventListener('input',(e)=>row.nama=e.target.value);
@@ -1453,8 +1507,10 @@ function renderPegawaiAI(body){
       unitInp.addEventListener('input',(e)=>row.unit=e.target.value);
       const jabInp = el('input',{value:row.jabatan,style:'width:100%;border:1px solid var(--line);border-radius:6px;padding:5px 7px;'});
       jabInp.addEventListener('input',(e)=>row.jabatan=e.target.value);
+      const tukinInp = el('input',{type:'number',value:row.tukin||0,style:'width:100%;border:1px solid var(--line);border-radius:6px;padding:5px 7px;'});
+      tukinInp.addEventListener('input',(e)=>row.tukin=Number(e.target.value)||0);
       table.appendChild(el('tr',null,[
-        el('td',null,[namaInp]), el('td',null,[unitInp]), el('td',null,[jabInp]),
+        el('td',null,[namaInp]), el('td',null,[unitInp]), el('td',null,[jabInp]), el('td',null,[tukinInp]),
         el('td',null,[el('button',{class:'btn btn-outline btn-sm', onclick:()=>{ state.aiImportPreview.splice(i,1); rerender(); }},['Buang'])])
       ]));
     });
@@ -1469,7 +1525,7 @@ function renderPegawaiAI(body){
           unit = {id:'unit_'+Date.now()+Math.floor(Math.random()*1000), nama:row.unit.trim(), password:''};
           state.units.push(unit);
         }
-        state.pegawai.push({id:'peg_'+Date.now()+Math.floor(Math.random()*1000), nama:row.nama.trim(), unitId: unit?unit.id:null, jabatan:row.jabatan.trim()||'-', tukin_maks:0});
+        state.pegawai.push({id:'peg_'+Date.now()+Math.floor(Math.random()*1000), nama:row.nama.trim(), unitId: unit?unit.id:null, jabatan:row.jabatan.trim()||'-', tukin_maks:row.tukin||0});
       }
       bgSave(saveUnitList()); bgSave(savePegawaiList());
       state.aiImportPreview = null;
