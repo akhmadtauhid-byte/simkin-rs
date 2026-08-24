@@ -138,6 +138,23 @@ tr:hover td{background:#FAFBFA;}
 .result-bar > div{height:100%;background:linear-gradient(90deg,var(--gold),var(--teal));}
 .loading{padding:60px;text-align:center;color:var(--ink-soft);}
 .footer-note{text-align:center;color:#9BA9A5;font-size:10.5px;margin-top:10px;padding-bottom:10px;}
+.print-only{display:none;}
+@media print{
+  .sidebar, .topbar, .cards-row, .footer-note, .btn, .no-print{display:none !important;}
+  .print-only{display:block !important;}
+  body{background:#fff;}
+  .app{display:block;}
+  .main{padding:0;max-width:100%;}
+  .panel{border:none;box-shadow:none;padding:0;margin:0;}
+  table{font-size:11px;}
+  th,td{padding:5px 6px;}
+}
+.print-header{margin-bottom:14px;border-bottom:2px solid #083836;padding-bottom:10px;}
+.print-header h2{font-family:'Lexend';font-size:16px;color:#083836;margin:0;}
+.print-header .sub{font-size:11px;color:#5B6B69;margin-top:3px;}
+.print-sign{display:flex;justify-content:space-between;margin-top:50px;gap:20px;}
+.print-sign .col{flex:1;text-align:center;font-size:11px;}
+.print-sign .col .line{margin-top:60px;border-top:1px solid #152524;padding-top:4px;}
 </style>
 </head>
 <body>
@@ -2063,6 +2080,36 @@ function renderAspekMaster(body){
 }
 
 /* ============ REKAP & TUKIN ============ */
+function exportRekapExcel(finals, periode){
+  const rows = [
+    ['REKAP PENILAIAN KINERJA & TUKIN — RSU ALLAM MEDICA'],
+    ['Periode: '+periode],
+    ['Dicetak: '+new Date().toLocaleString('id-ID')],
+    [],
+    ['Nama','Unit','Sikap Kerja','Kinerja Pelayanan','Mutu Pelayanan','Skor Akhir (%)','Grade','% Tukin','Nominal Tukin (Rp)','Status'],
+  ];
+  finals.forEach(({p,pn,f})=>{
+    const nominal = pn.status==='FINAL' ? Math.round(Number(p.tukin_maks||0) * f.tier.persen/100) : '';
+    rows.push([
+      p.nama, unitName(p.unitId),
+      f.sikapAvg!==null?Number(f.sikapAvg.toFixed(2)):'',
+      f.kinerjaAvg!==null?Number(f.kinerjaAvg.toFixed(2)):'',
+      f.mutuAvg!==null?Number(f.mutuAvg.toFixed(2)):'',
+      pn.status==='FINAL'?Number(f.percent.toFixed(1)):'',
+      pn.status==='FINAL'?f.tier.grade:'',
+      pn.status==='FINAL'?f.tier.persen:'',
+      nominal,
+      STATUS_LABEL[pn.status]||pn.status,
+    ]);
+  });
+  const ws = XLSX.utils.aoa_to_sheet(rows);
+  ws['!cols'] = [{wch:26},{wch:16},{wch:11},{wch:14},{wch:12},{wch:13},{wch:8},{wch:9},{wch:16},{wch:16}];
+  ws['!merges'] = [{s:{r:0,c:0},e:{r:0,c:9}},{s:{r:1,c:0},e:{r:1,c:9}},{s:{r:2,c:0},e:{r:2,c:9}}];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Rekap Tukin');
+  XLSX.writeFile(wb, 'Rekap-Tukin-'+periode.replace(/\s+/g,'-')+'.xlsx');
+}
+
 function renderRekap(body){
   const finals = state.pegawai.map(p=>({p, pn:getPenilaian(state.periode,p.id)}))
     .map(x=>({...x, f:computeFinal(x.pn, x.p.unitId)}));
@@ -2078,7 +2125,22 @@ function renderRekap(body){
   body.appendChild(cards);
 
   const panel = el('div',{class:'panel'});
-  panel.appendChild(el('h3',null,['Rekap Penilaian & Tukin — Periode '+state.periode]));
+
+  // Header khusus untuk versi cetak (tidak tampil di layar, hanya muncul saat print/PDF)
+  panel.appendChild(el('div',{class:'print-only print-header'},[
+    el('h2',null,['RSU ALLAM MEDICA']),
+    el('div',{class:'sub'},['Rekap Penilaian Kinerja & Tunjangan Kinerja (Tukin) — Periode '+state.periode]),
+    el('div',{class:'sub'},['Dicetak pada: '+new Date().toLocaleString('id-ID')]),
+  ]));
+
+  const headRow = el('div',{class:'no-print',style:'display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:14px;'});
+  headRow.appendChild(el('h3',{style:'margin:0;'},['Rekap Penilaian & Tukin — Periode '+state.periode]));
+  const btnRow = el('div',{style:'display:flex;gap:8px;'});
+  btnRow.appendChild(el('button',{class:'btn btn-outline btn-sm', onclick:()=>{ exportRekapExcel(finals, state.periode); }},['💾 Unduh Excel']));
+  btnRow.appendChild(el('button',{class:'btn btn-gold btn-sm', onclick:()=>{ window.print(); }},['🖨️ Cetak']));
+  headRow.appendChild(btnRow);
+  panel.appendChild(headRow);
+
   const table = el('table');
   table.appendChild(el('tr',null,[
     el('th',null,['Nama']),el('th',null,['Unit']),el('th',null,['Sikap']),el('th',null,['Kinerja']),el('th',null,['Mutu']),
@@ -2099,6 +2161,14 @@ function renderRekap(body){
     ]));
   });
   panel.appendChild(table);
+
+  // Blok tanda tangan khusus versi cetak
+  panel.appendChild(el('div',{class:'print-only print-sign'},[
+    el('div',{class:'col'},[el('div',{class:'line'},['Kepala Unit'])]),
+    el('div',{class:'col'},[el('div',{class:'line'},['Manajer HRD & Diklat'])]),
+    el('div',{class:'col'},[el('div',{class:'line'},['Direktur RSU Allam Medica'])]),
+  ]));
+
   body.appendChild(panel);
 }
 
