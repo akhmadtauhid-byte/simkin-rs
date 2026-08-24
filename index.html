@@ -387,6 +387,8 @@ let state = {
   perUnitWeight: {},            // {unitId: {sikap,kinerja,mutu}} - override per unit, opsional
   tiers: DEFAULT_TIERS,
   loaded: false,
+  appLocked: false,
+  appLockMessage: '',
   modal: null, // {type, pegawaiId}
   aiImportPreview: null, // for pegawai bulk import preview
   aiPenilaianResult: null, // for monthly AI-assisted assessment results
@@ -419,68 +421,106 @@ function unitNeedsLogin(unitId){
 function pnKey(periode, pegawaiId){ return periode+'::'+pegawaiId; }
 
 /* ============ STORAGE ============ */
+/** Menjalankan banyak tugas async secara paralel dengan batas jumlah bersamaan (supaya tidak membanjiri server). */
+async function mapLimit(items, limit, fn){
+  const results = new Array(items.length);
+  let idx = 0;
+  async function worker(){
+    while(idx < items.length){
+      const i = idx++;
+      try{ results[i] = await fn(items[i], i); }catch(e){ results[i] = undefined; }
+    }
+  }
+  const workers = Array.from({length: Math.max(1, Math.min(limit, items.length))}, worker);
+  await Promise.all(workers);
+  return results;
+}
+
 async function loadAll(){
   try{
-    const p = await Storage.get('pegawai-list', true);
-    state.pegawai = p ? JSON.parse(p.value) : [];
-  }catch(e){ state.pegawai = []; }
-
-  try{
-    const pl = await Storage.get('periode-list', true);
-    state.periodeList = pl ? JSON.parse(pl.value) : [];
-  }catch(e){ state.periodeList = []; }
-
-  if(state.periodeList.length===0){
-    const now = new Date();
-    const def = now.toLocaleString('id-ID',{month:'long',year:'numeric'});
-    state.periodeList = [def];
-  }
-  state.periode = state.periodeList[state.periodeList.length-1];
-
-  try{
-    const u = await Storage.get('unit-list', true);
-    state.units = u ? JSON.parse(u.value) : [];
-  }catch(e){ state.units = []; }
-  if(state.units.length>0) state.currentUnitId = state.units[0].id;
-
-  try{
-    const w = await Storage.get('bobot-config', true);
-    if(w){
-      const parsed = JSON.parse(w.value);
-      state.weight = parsed.weight||DEFAULT_WEIGHT;
-      state.tiers = parsed.tiers||DEFAULT_TIERS;
-      state.subWeight = parsed.subWeight||DEFAULT_SUBWEIGHT;
-      state.perUnitWeight = parsed.perUnitWeight||{};
+    const lic = await Storage.get('license_status', true);
+    if(lic && lic.value === 'locked'){
+      state.appLocked = true;
+      try{
+        const msg = await Storage.get('license_message', true);
+        state.appLockMessage = msg && msg.value ? msg.value : 'Aplikasi ini sedang dinonaktifkan sementara. Silakan hubungi pengembang sistem untuk informasi lebih lanjut.';
+      }catch(e){ state.appLockMessage = 'Aplikasi ini sedang dinonaktifkan sementara. Silakan hubungi pengembang sistem untuk informasi lebih lanjut.'; }
+      state.loaded = true;
+      return; // hentikan pemuatan data lain — aplikasi tidak akan menampilkan apa pun selain layar kunci
     }
-  }catch(e){}
+  }catch(e){ /* kalau gagal cek (offline/lokal), anggap tidak terkunci — gagal-aman, jangan sampai warga RS terkunci karena masalah jaringan */ }
 
-  try{
-    const ac = await Storage.get('aspek-config', true);
-    if(ac){
-      const parsed = JSON.parse(ac.value);
-      if(parsed.sikap && parsed.kinerja && parsed.mutu) state.aspekConfig = parsed;
-    }
-  }catch(e){}
-
-  try{
-    const th = await Storage.get('sikap-thresholds', true);
-    if(th){ state.sikapThresholds = JSON.parse(th.value); }
-  }catch(e){}
-
-  try{
-    const sec = await Storage.get('admin-security', true);
-    if(sec){
-      const parsed = JSON.parse(sec.value);
-      state.adminPin = parsed.pin || '';
-      state.superAdminPin = parsed.superPin || '';
-      state.hrdPin = parsed.hrdPin || parsed.diklatPin || ''; // migrasi otomatis dari PIN Diklat lama (peran sudah digabung)
-    }
-  }catch(e){}
-
-  try{
-    const gf = await Storage.get('absensi-config', true);
-    if(gf){ const parsed = JSON.parse(gf.value); state.geofence = parsed.geofence || state.geofence; state.shiftConfig = parsed.shiftConfig || state.shiftConfig; state.shiftDefs = parsed.shiftDefs || state.shiftDefs; }
-  }catch(e){}
+  // Semua konfigurasi dasar dimuat BERSAMAAN (bukan satu-satu) — inilah yang mempercepat waktu masuk aplikasi.
+  await Promise.all([
+    (async ()=>{
+      try{
+        const p = await Storage.get('pegawai-list', true);
+        state.pegawai = p ? JSON.parse(p.value) : [];
+      }catch(e){ state.pegawai = []; }
+    })(),
+    (async ()=>{
+      try{
+        const pl = await Storage.get('periode-list', true);
+        state.periodeList = pl ? JSON.parse(pl.value) : [];
+      }catch(e){ state.periodeList = []; }
+      if(state.periodeList.length===0){
+        const now = new Date();
+        state.periodeList = [now.toLocaleString('id-ID',{month:'long',year:'numeric'})];
+      }
+      state.periode = state.periodeList[state.periodeList.length-1];
+    })(),
+    (async ()=>{
+      try{
+        const u = await Storage.get('unit-list', true);
+        state.units = u ? JSON.parse(u.value) : [];
+      }catch(e){ state.units = []; }
+      if(state.units.length>0) state.currentUnitId = state.units[0].id;
+    })(),
+    (async ()=>{
+      try{
+        const w = await Storage.get('bobot-config', true);
+        if(w){
+          const parsed = JSON.parse(w.value);
+          state.weight = parsed.weight||DEFAULT_WEIGHT;
+          state.tiers = parsed.tiers||DEFAULT_TIERS;
+          state.subWeight = parsed.subWeight||DEFAULT_SUBWEIGHT;
+          state.perUnitWeight = parsed.perUnitWeight||{};
+        }
+      }catch(e){}
+    })(),
+    (async ()=>{
+      try{
+        const ac = await Storage.get('aspek-config', true);
+        if(ac){
+          const parsed = JSON.parse(ac.value);
+          if(parsed.sikap && parsed.kinerja && parsed.mutu) state.aspekConfig = parsed;
+        }
+      }catch(e){}
+    })(),
+    (async ()=>{
+      try{
+        const th = await Storage.get('sikap-thresholds', true);
+        if(th){ state.sikapThresholds = JSON.parse(th.value); }
+      }catch(e){}
+    })(),
+    (async ()=>{
+      try{
+        const sec = await Storage.get('admin-security', true);
+        if(sec){
+          const parsed = JSON.parse(sec.value);
+          state.adminPin = parsed.pin || '';
+          state.superAdminPin = parsed.superPin || '';
+          state.hrdPin = parsed.hrdPin || parsed.diklatPin || '';
+        }
+      }catch(e){}
+    })(),
+    (async ()=>{
+      try{
+        const gf = await Storage.get('absensi-config', true);
+        if(gf){ const parsed = JSON.parse(gf.value); state.geofence = parsed.geofence || state.geofence; state.shiftConfig = parsed.shiftConfig || state.shiftConfig; state.shiftDefs = parsed.shiftDefs || state.shiftDefs; }
+      }catch(e){}
+    })(),
+  ]);
 
   try{
     // identitas pemilik perangkat ini bersifat lokal (khas per HP), tidak ikut server bersama
@@ -494,8 +534,9 @@ async function loadAll(){
 async function loadPenilaianForPeriode(periode){
   try{
     const list = await Storage.list('penilaian:'+periode+':', true);
-    if(list && list.keys){
-      for(const k of list.keys){
+    if(list && list.keys && list.keys.length>0){
+      // Ambil semua data penilaian periode ini SEKALIGUS (maks 20 bersamaan) — bukan satu per satu.
+      await mapLimit(list.keys, 20, async (k)=>{
         try{
           const r = await Storage.get(k, true);
           if(r){
@@ -503,7 +544,7 @@ async function loadPenilaianForPeriode(periode){
             state.penilaian[pnKey(periode,pegId)] = JSON.parse(r.value);
           }
         }catch(e){}
-      }
+      });
     }
   }catch(e){}
 }
@@ -650,6 +691,8 @@ async function saveAbsensiLog(pegawaiId, dateISO, data){
   await Storage.set('absensi-log:'+pegawaiId+':'+dateISO, JSON.stringify(data), true);
 }
 async function doAbsen(pegawaiId, jenis){ // jenis: 'masuk' | 'pulang'
+  const dateISO = todayISO();
+  const logPromise = getAbsensiLog(pegawaiId, dateISO); // mulai diambil dari sekarang, berbarengan dengan proses GPS & verifikasi di bawah (tidak saling bergantung)
   const loc = await getCurrentLocation();
   if(state.geofence.lat!=null && state.geofence.lng!=null){
     const jarak = distanceMeters(loc.lat, loc.lng, state.geofence.lat, state.geofence.lng);
@@ -659,8 +702,7 @@ async function doAbsen(pegawaiId, jenis){ // jenis: 'masuk' | 'pulang'
   }
   const verified = await verifyIdentityForAbsen(pegawaiId);
   if(!verified) throw new Error('Verifikasi identitas gagal.');
-  const dateISO = todayISO();
-  const log = await getAbsensiLog(pegawaiId, dateISO);
+  const log = await logPromise; // pada titik ini biasanya sudah selesai duluan (GPS & verifikasi biasanya lebih lama)
   const now = new Date();
   const jam = now.toTimeString().slice(0,5);
   log[jenis] = { jam, lat:loc.lat, lng:loc.lng };
@@ -867,6 +909,17 @@ async function render(){
   const root = document.getElementById('root');
   root.className='';
   root.innerHTML='';
+
+  if(state.appLocked){
+    const lockWrap = el('div',{style:'min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--teal-deep);padding:24px;'});
+    const card = el('div',{style:'background:#fff;border-radius:16px;padding:32px 28px;max-width:420px;text-align:center;'});
+    card.appendChild(el('div',{style:'font-size:40px;margin-bottom:10px;'},['🔒']));
+    card.appendChild(el('h2',{style:'color:var(--teal-deep);margin-bottom:10px;'},['Akses Sistem Dinonaktifkan']));
+    card.appendChild(el('div',{style:'color:var(--ink-soft);font-size:13.5px;line-height:1.6;'},[state.appLockMessage]));
+    lockWrap.appendChild(card);
+    root.appendChild(lockWrap);
+    return;
+  }
 
   const app = el('div',{class:'app'});
 
@@ -1192,13 +1245,15 @@ function renderAbsenMandiri(body){
 
   body.appendChild(panel);
 
-  // muat status hari ini secara async setelah elemen ter-render
+  // muat status hari ini secara async setelah elemen ter-render — dua panggilan ini dikirim BERSAMAAN, bukan menunggu satu selesai dulu
   (async ()=>{
-    const log = await getAbsensiLog(me.id, todayISO());
+    const [log, shift] = await Promise.all([
+      getAbsensiLog(me.id, todayISO()),
+      getShiftForDate(me.id, todayISO()),
+    ]);
     const mEl = document.getElementById('st-masuk'); const pEl = document.getElementById('st-pulang');
     if(mEl) mEl.textContent = log.masuk ? log.masuk.jam : '—';
     if(pEl) pEl.textContent = log.pulang ? log.pulang.jam : '—';
-    const shift = await getShiftForDate(me.id, todayISO());
     const sEl = document.getElementById('st-shift');
     if(sEl) sEl.textContent = shift.libur ? '🛌 Hari ini libur' : '🕐 Shift: '+shift.nama+' ('+shift.jamMulai+(shift.jamSelesai?'–'+shift.jamSelesai:'')+')';
   })();
