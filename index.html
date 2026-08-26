@@ -317,18 +317,84 @@ async function testGasConnection(){
   return log;
 }
 
+const MAX_CELL_CHARS = 40000; // aman di bawah batas 50.000 karakter/sel Google Sheets, dengan margin
+
+/** Panggilan mentah ke server (tanpa pemecahan) — dipakai internal oleh lapisan chunking di bawah. */
+async function _gasGetRaw(key){
+  for(let attempt=0; attempt<2; attempt++){
+    try{
+      const r = await gasFetch({action:'get', key});
+      return r.value!==undefined && r.value!==null && r.value!=='' ? r.value : null;
+    }catch(e){
+      if(attempt===0) await new Promise(res=>setTimeout(res,400));
+      else throw e;
+    }
+  }
+}
+async function _gasSetRaw(key, value){
+  let lastErr = null;
+  for(let attempt=0; attempt<2; attempt++){
+    try{ await gasFetch(null, true, {action:'set', key, value}); return; }
+    catch(e){ lastErr = e; if(attempt===0) await new Promise(res=>setTimeout(res,400)); }
+  }
+  throw new Error('Gagal menyimpan "'+key+'" ke server bersama: '+(lastErr&&lastErr.message||lastErr));
+}
+async function _gasDeleteRaw(key){
+  let lastErr = null;
+  for(let attempt=0; attempt<2; attempt++){
+    try{ await gasFetch(null, true, {action:'delete', key}); return; }
+    catch(e){ lastErr = e; if(attempt===0) await new Promise(res=>setTimeout(res,400)); }
+  }
+  throw new Error('Gagal menghapus "'+key+'" di server bersama: '+(lastErr&&lastErr.message||lastErr));
+}
+
+/** Simpan nilai apa pun ke server — otomatis dipecah jadi beberapa bagian kalau melebihi batas karakter per sel Google Sheets. */
+async function _gasSetChunked(key, value){
+  if(value.length <= MAX_CELL_CHARS){
+    await _gasSetRaw(key, value);
+    return;
+  }
+  const chunks = [];
+  for(let i=0;i<value.length;i+=MAX_CELL_CHARS) chunks.push(value.slice(i, i+MAX_CELL_CHARS));
+  for(let i=0;i<chunks.length;i++){
+    await _gasSetRaw(key+'::chunk:'+i, chunks[i]); // simpan tiap bagian dulu, satu per satu
+  }
+  // manifest ditulis PALING TERAKHIR — kalau ada bagian yang gagal di tengah, manifest lama/tidak ada, jadi get() tidak akan membaca data setengah jadi
+  await _gasSetRaw(key, JSON.stringify({__simkinChunked__:true, count:chunks.length}));
+}
+/** Ambil nilai dari server — otomatis menyatukan kembali kalau nilainya berupa data yang terpecah. */
+async function _gasGetChunked(key){
+  const raw = await _gasGetRaw(key);
+  if(raw===null) return null;
+  try{
+    const parsed = JSON.parse(raw);
+    if(parsed && parsed.__simkinChunked__===true){
+      const parts = await Promise.all(Array.from({length:parsed.count}, (_,i)=>_gasGetRaw(key+'::chunk:'+i)));
+      return parts.map(p=>p||'').join('');
+    }
+  }catch(e){ /* bukan manifest pemecahan, berarti data biasa — pakai apa adanya */ }
+  return raw;
+}
+async function _gasDeleteChunked(key){
+  const raw = await _gasGetRaw(key);
+  if(raw!==null){
+    try{
+      const parsed = JSON.parse(raw);
+      if(parsed && parsed.__simkinChunked__===true){
+        for(let i=0;i<parsed.count;i++) await _gasDeleteRaw(key+'::chunk:'+i);
+      }
+    }catch(e){}
+  }
+  await _gasDeleteRaw(key);
+}
+
 const Storage = {
   async get(key, shared){
     if(STORAGE_MODE==='gas'){
-      // coba sampai 2x kalau gagal (jaringan/server lambat) sebelum menyerah — mencegah data dianggap "kosong" gara-gara gangguan sesaat
-      for(let attempt=0; attempt<2; attempt++){
-        try{
-          const r = await gasFetch({action:'get', key});
-          return r.value!==undefined && r.value!==null && r.value!=='' ? {key, value:r.value, shared} : null;
-        }catch(e){
-          if(attempt===0) await new Promise(res=>setTimeout(res,400)); // jeda sebentar sebelum coba ulang
-        }
-      }
+      try{
+        const value = await _gasGetChunked(key);
+        return value!==null ? {key, value, shared} : null;
+      }catch(e){ /* jatuhkan ke lokal di bawah kalau server benar-benar tidak terjangkau */ }
     } else if(STORAGE_MODE==='cloud'){
       try{ return await window.storage.get(key, shared); }catch(e){ /* jatuhkan ke lokal */ }
     }
@@ -339,39 +405,19 @@ const Storage = {
   },
   async set(key, value, shared){
     if(STORAGE_MODE==='gas'){
-      // coba sampai 2x — tapi kalau tetap gagal, JANGAN diam-diam simpan ke lokal seolah berhasil.
-      // Ini data bersama (multi-perangkat) — kalau gagal simpan ke server, pemanggil WAJIB tahu supaya bisa memberi tahu pengguna.
-      let lastErr = null;
-      for(let attempt=0; attempt<2; attempt++){
-        try{
-          await gasFetch(null, true, {action:'set', key, value});
-          return {key, value, shared};
-        }catch(e){
-          lastErr = e;
-          if(attempt===0) await new Promise(res=>setTimeout(res,400));
-        }
-      }
-      throw new Error('Gagal menyimpan "'+key+'" ke server bersama: '+(lastErr&&lastErr.message||lastErr));
+      // Data bersama (multi-perangkat) — kalau gagal simpan ke server, JANGAN diam-diam simpan ke lokal seolah berhasil; biarkan pemanggil tahu.
+      await _gasSetChunked(key, value);
+      return {key, value, shared};
     } else if(STORAGE_MODE==='cloud'){
       return await window.storage.set(key, value, shared); // biarkan error menjalar kalau gagal, jangan disembunyikan
     }
-    // hanya sampai di sini kalau memang mode lokal murni (tidak ada server terkonfigurasi sama sekali)
     window.localStorage.setItem(LS_PREFIX+key, value);
     return {key, value, shared};
   },
   async delete(key, shared){
     if(STORAGE_MODE==='gas'){
-      let lastErr = null;
-      for(let attempt=0; attempt<2; attempt++){
-        try{
-          await gasFetch(null, true, {action:'delete', key});
-          return {key, deleted:true, shared};
-        }catch(e){
-          lastErr = e;
-          if(attempt===0) await new Promise(res=>setTimeout(res,400));
-        }
-      }
-      throw new Error('Gagal menghapus "'+key+'" di server bersama: '+(lastErr&&lastErr.message||lastErr));
+      await _gasDeleteChunked(key);
+      return {key, deleted:true, shared};
     } else if(STORAGE_MODE==='cloud'){
       return await window.storage.delete(key, shared);
     }
@@ -380,8 +426,11 @@ const Storage = {
   },
   async list(prefix, shared){
     if(STORAGE_MODE==='gas'){
-      try{ const r = await gasFetch({action:'list', prefix: prefix||''}); return {keys: r.keys||[], prefix, shared}; }
-      catch(e){}
+      try{
+        const r = await gasFetch({action:'list', prefix: prefix||''});
+        const keys = (r.keys||[]).filter(k=>k.indexOf('::chunk:')===-1); // sembunyikan bagian-bagian pecahan dari daftar, itu detail internal
+        return {keys, prefix, shared};
+      }catch(e){}
     } else if(STORAGE_MODE==='cloud'){
       try{ return await window.storage.list(prefix, shared); }catch(e){}
     }
