@@ -266,13 +266,18 @@ const STORAGE_MODE = GAS_WEBAPP_URL ? 'gas'
   : ((typeof window !== 'undefined' && typeof window.storage !== 'undefined' && window.storage !== null) ? 'cloud' : 'local');
 
 async function gasFetch(params, isPost, body){
-  // Cegah browser (di luar Incognito) menyajikan jawaban LAMA dari cache HTTP-nya sendiri untuk URL yang sama —
-  // ditambahkan parameter waktu unik + cache:'no-store' supaya selalu ambil data terbaru dari server, bukan cache lokal browser.
+  // PENTING: penangkal cache (parameter waktu unik + cache:'no-store') HANYA dipasang untuk permintaan GET.
+  // Browser TIDAK PERNAH men-cache respons POST secara default, jadi tidak perlu ditangkal — dan menambahkannya ke POST
+  // ternyata membuat Google Apps Script gagal memproses pengalihan otomatisnya, menyebabkan diblokir CORS. Ini pelajaran mahal.
+  if(isPost){
+    const url = GAS_WEBAPP_URL;
+    const opts = { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify(body) };
+    const res = await fetch(url, opts);
+    return await res.json();
+  }
   const cacheBuster = '_ts=' + Date.now() + Math.random().toString(36).slice(2);
-  const url = GAS_WEBAPP_URL + (isPost ? ('?'+cacheBuster) : ('?' + new URLSearchParams(params).toString() + '&' + cacheBuster));
-  const opts = isPost
-    ? { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify(body), cache:'no-store' }
-    : { method:'GET', cache:'no-store' };
+  const url = GAS_WEBAPP_URL + '?' + new URLSearchParams(params).toString() + '&' + cacheBuster;
+  const opts = { method:'GET', cache:'no-store' };
   const res = await fetch(url, opts);
   return await res.json();
 }
