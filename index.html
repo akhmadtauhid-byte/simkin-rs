@@ -453,6 +453,47 @@ async function mapLimit(items, limit, fn){
   return results;
 }
 
+/* ============ CACHE LOKAL (untuk mempercepat tampilan awal) ============ */
+const LOCAL_CACHE_KEY = 'simkin_rs_cache_v1';
+function loadFromLocalCache(){
+  try{
+    const raw = window.localStorage.getItem(LOCAL_CACHE_KEY);
+    if(!raw) return false;
+    const c = JSON.parse(raw);
+    state.pegawai = c.pegawai || [];
+    state.units = c.units || [];
+    state.periodeList = c.periodeList && c.periodeList.length ? c.periodeList : state.periodeList;
+    state.periode = c.periode || state.periode;
+    state.weight = c.weight || state.weight;
+    state.subWeight = c.subWeight || state.subWeight;
+    state.tiers = c.tiers || state.tiers;
+    state.perUnitWeight = c.perUnitWeight || {};
+    state.aspekConfig = c.aspekConfig || state.aspekConfig;
+    state.sikapThresholds = c.sikapThresholds || state.sikapThresholds;
+    state.adminPin = c.adminPin || '';
+    state.superAdminPin = c.superAdminPin || '';
+    state.hrdPin = c.hrdPin || '';
+    state.geofence = c.geofence || state.geofence;
+    state.shiftConfig = c.shiftConfig || state.shiftConfig;
+    state.shiftDefs = c.shiftDefs || state.shiftDefs;
+    state.penilaian = c.penilaian || {};
+    if(state.units.length>0 && !state.currentUnitId) state.currentUnitId = state.units[0].id;
+    return true;
+  }catch(e){ return false; }
+}
+function saveToLocalCache(){
+  try{
+    window.localStorage.setItem(LOCAL_CACHE_KEY, JSON.stringify({
+      pegawai: state.pegawai, units: state.units, periodeList: state.periodeList, periode: state.periode,
+      weight: state.weight, subWeight: state.subWeight, tiers: state.tiers, perUnitWeight: state.perUnitWeight,
+      aspekConfig: state.aspekConfig, sikapThresholds: state.sikapThresholds,
+      adminPin: state.adminPin, superAdminPin: state.superAdminPin, hrdPin: state.hrdPin,
+      geofence: state.geofence, shiftConfig: state.shiftConfig, shiftDefs: state.shiftDefs,
+      penilaian: state.penilaian,
+    }));
+  }catch(e){}
+}
+
 async function loadAll(){
   try{
     const lic = await Storage.get('license_status', true);
@@ -546,6 +587,7 @@ async function loadAll(){
 
   await loadPenilaianForPeriode(state.periode);
   state.loaded = true;
+  saveToLocalCache(); // simpan hasil terbaru untuk mempercepat kunjungan berikutnya
 }
 
 async function loadPenilaianForPeriode(periode){
@@ -1531,6 +1573,18 @@ function renderPegawai(body){
     const table = el('table');
     table.appendChild(el('tr',null,[el('th',null,['Nama']),el('th',null,['Unit']),el('th',null,['Jabatan']),el('th',null,['Shift']),el('th',null,['Tukin Maks (Rp)']),el('th',null,[''])]));
     state.pegawai.forEach(p=>{
+      const unitSel = el('select',{style:'padding:5px 7px;border:1px solid var(--line);border-radius:6px;font-size:12px;'+(!p.unitId?'border-color:var(--red);':'')});
+      unitSel.appendChild(el('option',{value:''},['— Belum diatur —']));
+      state.units.forEach(u=>{
+        const o = el('option',{value:u.id},[u.nama]);
+        if(p.unitId===u.id) o.selected = true;
+        unitSel.appendChild(o);
+      });
+      unitSel.addEventListener('change', e=>{
+        p.unitId = e.target.value || null;
+        rerender();
+        bgSave(savePegawaiList());
+      });
       const shiftSel = el('select',{style:'padding:5px 7px;border:1px solid var(--line);border-radius:6px;font-size:12px;'});
       shiftSel.appendChild(el('option',{value:''},['— Default —']));
       state.shiftDefs.forEach(s=>{
@@ -1543,16 +1597,19 @@ function renderPegawai(body){
         bgSave(savePegawaiList());
       });
       table.appendChild(el('tr',null,[
-        el('td',null,[p.nama]), el('td',null,[unitName(p.unitId)]), el('td',null,[p.jabatan]),
+        el('td',null,[p.nama]), el('td',null,[unitSel]), el('td',null,[p.jabatan]),
         el('td',null,[shiftSel]),
         el('td',null,[p.tukin_maks? Number(p.tukin_maks).toLocaleString('id-ID') : '-']),
-        el('td',null,[el('button',{class:'btn btn-outline btn-sm', onclick:()=>{
-          if(confirm('Hapus pegawai '+p.nama+'?')){
-            state.pegawai = state.pegawai.filter(x=>x.id!==p.id);
-            rerender();
-            bgSave(savePegawaiList());
-          }
-        }},['Hapus'])])
+        el('td',null,[
+          el('button',{class:'btn btn-outline btn-sm',style:'margin-right:6px;', onclick:()=>{ state.modal={type:'edit_pegawai', pegawaiId:p.id}; rerender(); }},['Edit']),
+          el('button',{class:'btn btn-outline btn-sm', onclick:()=>{
+            if(confirm('Hapus pegawai '+p.nama+'?')){
+              state.pegawai = state.pegawai.filter(x=>x.id!==p.id);
+              rerender();
+              bgSave(savePegawaiList());
+            }
+          }},['Hapus'])
+        ])
       ]));
     });
     panel.appendChild(table);
@@ -2565,11 +2622,52 @@ function renderModal(){
   bg.appendChild(modal);
 
   if(state.modal.type==='add_pegawai') buildAddPegawaiModal(modal);
+  if(state.modal.type==='edit_pegawai') buildEditPegawaiModal(modal, state.modal.pegawaiId);
   if(state.modal.type==='input_penilaian') buildInputPenilaianModal(modal);
   if(state.modal.type==='validasi_hrd') buildValidasiHRDModal(modal);
   if(state.modal.type==='validasi_diklat') buildValidasiDiklatModal(modal);
 
   document.getElementById('root').appendChild(bg);
+}
+
+function buildEditPegawaiModal(modal, pegawaiId){
+  const p = state.pegawai.find(x=>x.id===pegawaiId);
+  if(!p){
+    modal.appendChild(el('div',{class:'warn-note'},['Pegawai tidak ditemukan (mungkin sudah dihapus).']));
+    modal.appendChild(el('div',{style:'margin-top:14px;display:flex;justify-content:flex-end;'},[el('button',{class:'btn btn-outline', onclick:()=>{state.modal=null; rerender();}},['Tutup'])]));
+    return;
+  }
+  modal.appendChild(el('div',{class:'modal-head'},[el('h3',null,['Edit Pegawai']), el('button',{class:'x-btn', onclick:()=>{state.modal=null; rerender();}},['✕'])]));
+  const grid = el('div',{class:'form-grid'});
+  const nama = el('input',{value:p.nama});
+  const unitSel = el('select');
+  state.units.forEach(u=>{ const o=el('option',{value:u.id},[u.nama]); if(u.id===p.unitId) o.selected=true; unitSel.appendChild(o); });
+  const jabatan = el('input',{value:p.jabatan||''});
+  const tukin = el('input',{type:'number',value:p.tukin_maks||0});
+  const shiftSel = el('select');
+  shiftSel.appendChild(el('option',{value:''},['(Belum diatur — pakai default)']));
+  state.shiftDefs.forEach(s=>{ const o=el('option',{value:s.key},[s.nama+' ('+s.jamMulai+'–'+s.jamSelesai+')']); if(p.shiftKey===s.key) o.selected=true; shiftSel.appendChild(o); });
+  grid.appendChild(el('div',{class:'field'},[el('label',null,['Nama']),nama]));
+  grid.appendChild(el('div',{class:'field'},[el('label',null,['Unit']),unitSel]));
+  grid.appendChild(el('div',{class:'field'},[el('label',null,['Jabatan']),jabatan]));
+  grid.appendChild(el('div',{class:'field'},[el('label',null,['Tukin Maksimal (Rp)']),tukin]));
+  grid.appendChild(el('div',{class:'field'},[el('label',null,['Shift Kerja']),shiftSel]));
+  modal.appendChild(grid);
+  if(state.units.length===0) modal.appendChild(el('div',{class:'warn-note',style:'margin-top:10px;'},['Belum ada unit terdaftar — tambahkan dulu di menu "Data Unit" supaya bisa dipilih di sini.']));
+  modal.appendChild(el('div',{style:'margin-top:18px;display:flex;justify-content:flex-end;gap:8px;'},[
+    el('button',{class:'btn btn-outline', onclick:()=>{state.modal=null; rerender();}},['Batal']),
+    el('button',{class:'btn btn-primary', onclick:()=>{
+      if(!nama.value.trim()){ alert('Nama wajib diisi'); return; }
+      p.nama = nama.value.trim();
+      p.unitId = unitSel.value || null;
+      p.jabatan = jabatan.value.trim()||'-';
+      p.tukin_maks = tukin.value||0;
+      p.shiftKey = shiftSel.value||'';
+      state.modal=null;
+      rerender();
+      bgSave(savePegawaiList());
+    }},['Simpan Perubahan'])
+  ]));
 }
 
 function buildAddPegawaiModal(modal){
@@ -2827,7 +2925,12 @@ function buildValidasiDiklatModal(modal){
 
 /* ============ INIT ============ */
 (async function init(){
-  await loadAll();
+  const hadCache = loadFromLocalCache();
+  if(hadCache){
+    state.loaded = true;
+    await render(); // tampil instan dari cache lokal dulu, sambil data terbaru diambil di belakang layar
+  }
+  await loadAll(); // selalu ambil data terbaru dari server (menimpa cache kalau ada perubahan)
   await render();
 })();
 </script>
