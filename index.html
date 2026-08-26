@@ -266,10 +266,13 @@ const STORAGE_MODE = GAS_WEBAPP_URL ? 'gas'
   : ((typeof window !== 'undefined' && typeof window.storage !== 'undefined' && window.storage !== null) ? 'cloud' : 'local');
 
 async function gasFetch(params, isPost, body){
-  const url = GAS_WEBAPP_URL + (isPost ? '' : ('?' + new URLSearchParams(params).toString()));
+  // Cegah browser (di luar Incognito) menyajikan jawaban LAMA dari cache HTTP-nya sendiri untuk URL yang sama —
+  // ditambahkan parameter waktu unik + cache:'no-store' supaya selalu ambil data terbaru dari server, bukan cache lokal browser.
+  const cacheBuster = '_ts=' + Date.now() + Math.random().toString(36).slice(2);
+  const url = GAS_WEBAPP_URL + (isPost ? ('?'+cacheBuster) : ('?' + new URLSearchParams(params).toString() + '&' + cacheBuster));
   const opts = isPost
-    ? { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify(body) }
-    : { method:'GET' };
+    ? { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify(body), cache:'no-store' }
+    : { method:'GET', cache:'no-store' };
   const res = await fetch(url, opts);
   return await res.json();
 }
@@ -331,27 +334,44 @@ const Storage = {
   },
   async set(key, value, shared){
     if(STORAGE_MODE==='gas'){
-      try{ await gasFetch(null, true, {action:'set', key, value}); return {key, value, shared}; }
-      catch(e){ /* jatuhkan ke lokal */ }
+      // coba sampai 2x — tapi kalau tetap gagal, JANGAN diam-diam simpan ke lokal seolah berhasil.
+      // Ini data bersama (multi-perangkat) — kalau gagal simpan ke server, pemanggil WAJIB tahu supaya bisa memberi tahu pengguna.
+      let lastErr = null;
+      for(let attempt=0; attempt<2; attempt++){
+        try{
+          await gasFetch(null, true, {action:'set', key, value});
+          return {key, value, shared};
+        }catch(e){
+          lastErr = e;
+          if(attempt===0) await new Promise(res=>setTimeout(res,400));
+        }
+      }
+      throw new Error('Gagal menyimpan "'+key+'" ke server bersama: '+(lastErr&&lastErr.message||lastErr));
     } else if(STORAGE_MODE==='cloud'){
-      try{ return await window.storage.set(key, value, shared); }catch(e){ /* jatuhkan ke lokal */ }
+      return await window.storage.set(key, value, shared); // biarkan error menjalar kalau gagal, jangan disembunyikan
     }
-    try{
-      window.localStorage.setItem(LS_PREFIX+key, value);
-      return {key, value, shared};
-    }catch(e){ return null; }
+    // hanya sampai di sini kalau memang mode lokal murni (tidak ada server terkonfigurasi sama sekali)
+    window.localStorage.setItem(LS_PREFIX+key, value);
+    return {key, value, shared};
   },
   async delete(key, shared){
     if(STORAGE_MODE==='gas'){
-      try{ await gasFetch(null, true, {action:'delete', key}); return {key, deleted:true, shared}; }
-      catch(e){}
+      let lastErr = null;
+      for(let attempt=0; attempt<2; attempt++){
+        try{
+          await gasFetch(null, true, {action:'delete', key});
+          return {key, deleted:true, shared};
+        }catch(e){
+          lastErr = e;
+          if(attempt===0) await new Promise(res=>setTimeout(res,400));
+        }
+      }
+      throw new Error('Gagal menghapus "'+key+'" di server bersama: '+(lastErr&&lastErr.message||lastErr));
     } else if(STORAGE_MODE==='cloud'){
-      try{ return await window.storage.delete(key, shared); }catch(e){}
+      return await window.storage.delete(key, shared);
     }
-    try{
-      window.localStorage.removeItem(LS_PREFIX+key);
-      return {key, deleted:true, shared};
-    }catch(e){ return null; }
+    window.localStorage.removeItem(LS_PREFIX+key);
+    return {key, deleted:true, shared};
   },
   async list(prefix, shared){
     if(STORAGE_MODE==='gas'){
@@ -627,9 +647,11 @@ async function loadPenilaianForPeriode(periode){
 const _saveQueues = {};
 function queuedSave(queueKey, saveFn){
   const prev = _saveQueues[queueKey] || Promise.resolve();
-  const next = prev.then(saveFn).catch(err=>{ console.error('Gagal menyimpan ('+queueKey+'):', err); });
-  _saveQueues[queueKey] = next;
-  return next;
+  // saveFn tetap dijalankan berikutnya walau penyimpanan SEBELUMNYA di antrean ini gagal (supaya antrean tidak macet permanen)...
+  const thisSave = prev.then(saveFn, saveFn);
+  // ...tapi antrean internal tetap "sehat" untuk penyimpanan berikutnya, terlepas dari hasil penyimpanan saat ini.
+  _saveQueues[queueKey] = thisSave.catch(()=>{});
+  return thisSave; // pemanggil (bgSave / kode lain) TETAP melihat apakah penyimpanan INI berhasil atau gagal — tidak lagi disembunyikan
 }
 
 async function savePegawaiList(){
@@ -889,9 +911,18 @@ async function savePenilaian(periode, pegawaiId){
   const data = state.penilaian[pnKey(periode,pegawaiId)];
   await Storage.set('penilaian:'+periode+':'+pegawaiId, JSON.stringify(data), true);
 }
+let _saveFailAlertShown = false;
 function bgSave(promise){
-  // Fire a save in the background without blocking the UI refresh; log failures instead of stalling the interface.
-  Promise.resolve(promise).catch(err=>{ console.error('Gagal menyimpan ke penyimpanan:', err); });
+  // Simpan di latar belakang supaya tampilan tetap terasa instan — TAPI kalau gagal, pengguna WAJIB diberi tahu jelas,
+  // bukan cuma dicatat diam-diam di console (yang tidak pernah dilihat pengguna biasa).
+  Promise.resolve(promise).catch(err=>{
+    console.error('Gagal menyimpan ke penyimpanan:', err);
+    if(!_saveFailAlertShown){
+      _saveFailAlertShown = true;
+      alert('⚠️ Gagal menyimpan perubahan ke server bersama!\n\nPerubahan ini KEMUNGKINAN TIDAK TERSIMPAN dan bisa hilang. Periksa koneksi internet Anda, lalu ulangi perubahan tadi.\n\nDetail teknis: '+(err && err.message ? err.message : err));
+      setTimeout(()=>{ _saveFailAlertShown = false; }, 5000); // supaya tidak membanjiri dengan alert berulang-ulang dalam waktu singkat
+    }
+  });
 }
 
 function getPenilaian(periode, pegawaiId){
@@ -1767,24 +1798,42 @@ function renderPegawaiAI(body){
         el('td',null,[el('button',{class:'btn btn-outline btn-sm', onclick:()=>{ state.aiImportPreview.splice(i,1); rerender(); }},['Buang'])])
       ]));
     });
-    prevPanel.appendChild(table);
-    const actions = el('div',{style:'margin-top:14px;display:flex;gap:8px;justify-content:flex-end;'});
+    const actions = el('div',{style:'margin-top:14px;display:flex;gap:8px;justify-content:flex-end;align-items:center;'});
     actions.appendChild(el('button',{class:'btn btn-outline', onclick:()=>{ state.aiImportPreview=null; rerender(); }},['Batalkan']));
-    actions.appendChild(el('button',{class:'btn btn-primary', onclick:()=>{
+    const saveAllBtn = el('button',{class:'btn btn-primary', onclick: async ()=>{
+      saveAllBtn.disabled = true; saveAllBtn.textContent = 'Menyimpan ke server…';
+      const newUnits = [];
+      const newPegawai = [];
       for(const row of state.aiImportPreview){
         if(!row.nama.trim()) continue;
-        let unit = state.units.find(u=>u.nama.toLowerCase()===row.unit.trim().toLowerCase());
+        let unit = state.units.find(u=>u.nama.toLowerCase()===row.unit.trim().toLowerCase()) || newUnits.find(u=>u.nama.toLowerCase()===row.unit.trim().toLowerCase());
         if(!unit && row.unit.trim()){
           unit = {id:'unit_'+Date.now()+Math.floor(Math.random()*1000), nama:row.unit.trim(), password:''};
-          state.units.push(unit);
+          newUnits.push(unit);
         }
-        state.pegawai.push({id:'peg_'+Date.now()+Math.floor(Math.random()*1000), nama:row.nama.trim(), unitId: unit?unit.id:null, jabatan:row.jabatan.trim()||'-', tukin_maks:row.tukin||0, shiftKey:row.shiftKey||''});
+        newPegawai.push({id:'peg_'+Date.now()+Math.floor(Math.random()*1000), nama:row.nama.trim(), unitId: unit?unit.id:null, jabatan:row.jabatan.trim()||'-', tukin_maks:row.tukin||0, shiftKey:row.shiftKey||''});
       }
-      bgSave(saveUnitList()); bgSave(savePegawaiList());
-      state.aiImportPreview = null;
-      state.aiPdfPegawai = null;
-      rerender();
-    }},['Simpan Semua ke Data Pegawai']));
+      state.units.push(...newUnits);
+      state.pegawai.push(...newPegawai);
+      try{
+        // WAJIB ditunggu (bukan bgSave) dan hasilnya dicek — supaya import massal seperti ini benar-benar dipastikan tersimpan ke server sebelum dianggap selesai.
+        if(newUnits.length>0) await saveUnitList();
+        await savePegawaiList();
+        state.aiImportPreview = null;
+        state.aiPdfPegawai = null;
+        rerender();
+        alert('✓ Berhasil disimpan ke server: '+newPegawai.length+' pegawai'+(newUnits.length?' + '+newUnits.length+' unit baru':'')+'.');
+      }catch(err){
+        // GAGAL tersimpan ke server — batalkan penambahan lokal supaya tidak memberi kesan palsu "sudah tersimpan"
+        state.pegawai.splice(state.pegawai.length-newPegawai.length, newPegawai.length);
+        state.units.splice(state.units.length-newUnits.length, newUnits.length);
+        saveAllBtn.disabled = false; saveAllBtn.textContent = 'Simpan Semua ke Data Pegawai';
+        rerender();
+        alert('❌ GAGAL menyimpan ke server. Data BELUM tersimpan — silakan periksa koneksi internet dan coba lagi.\n\nDetail: '+(err && err.message ? err.message : err));
+      }
+    }},['Simpan Semua ke Data Pegawai']);
+    actions.appendChild(saveAllBtn);
+    prevPanel.appendChild(table);
     prevPanel.appendChild(actions);
     body.appendChild(prevPanel);
   }
