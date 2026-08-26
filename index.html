@@ -312,8 +312,15 @@ async function testGasConnection(){
 const Storage = {
   async get(key, shared){
     if(STORAGE_MODE==='gas'){
-      try{ const r = await gasFetch({action:'get', key}); return r.value!==undefined && r.value!==null && r.value!=='' ? {key, value:r.value, shared} : null; }
-      catch(e){ /* jatuhkan ke lokal */ }
+      // coba sampai 2x kalau gagal (jaringan/server lambat) sebelum menyerah — mencegah data dianggap "kosong" gara-gara gangguan sesaat
+      for(let attempt=0; attempt<2; attempt++){
+        try{
+          const r = await gasFetch({action:'get', key});
+          return r.value!==undefined && r.value!==null && r.value!=='' ? {key, value:r.value, shared} : null;
+        }catch(e){
+          if(attempt===0) await new Promise(res=>setTimeout(res,400)); // jeda sebentar sebelum coba ulang
+        }
+      }
     } else if(STORAGE_MODE==='cloud'){
       try{ return await window.storage.get(key, shared); }catch(e){ /* jatuhkan ke lokal */ }
     }
@@ -468,14 +475,15 @@ function loadFromLocalCache(){
     state.subWeight = c.subWeight || state.subWeight;
     state.tiers = c.tiers || state.tiers;
     state.perUnitWeight = c.perUnitWeight || {};
-    state.aspekConfig = c.aspekConfig || state.aspekConfig;
-    state.sikapThresholds = c.sikapThresholds || state.sikapThresholds;
+    state.aspekConfig = (c.aspekConfig && c.aspekConfig.sikap && c.aspekConfig.kinerja && c.aspekConfig.mutu) ? c.aspekConfig : state.aspekConfig;
+    // sikapThresholds harus punya keempat aspek lengkap, kalau tidak — pertahankan default bawaan (mencegah crash saat menghitung skor)
+    state.sikapThresholds = (c.sikapThresholds && c.sikapThresholds.kehadiran && c.sikapThresholds.ketepatan_waktu && c.sikapThresholds.kepatuhan_izin && c.sikapThresholds.kedisiplinan) ? c.sikapThresholds : state.sikapThresholds;
     state.adminPin = c.adminPin || '';
     state.superAdminPin = c.superAdminPin || '';
     state.hrdPin = c.hrdPin || '';
     state.geofence = c.geofence || state.geofence;
     state.shiftConfig = c.shiftConfig || state.shiftConfig;
-    state.shiftDefs = c.shiftDefs || state.shiftDefs;
+    state.shiftDefs = (c.shiftDefs && c.shiftDefs.length) ? c.shiftDefs : state.shiftDefs;
     state.penilaian = c.penilaian || {};
     if(state.units.length>0 && !state.currentUnitId) state.currentUnitId = state.units[0].id;
     return true;
@@ -509,30 +517,36 @@ async function loadAll(){
   }catch(e){ /* kalau gagal cek (offline/lokal), anggap tidak terkunci — gagal-aman, jangan sampai warga RS terkunci karena masalah jaringan */ }
 
   // Semua konfigurasi dasar dimuat BERSAMAAN (bukan satu-satu) — inilah yang mempercepat waktu masuk aplikasi.
+  // PENTING: kalau pengambilan gagal/kosong, JANGAN timpa data yang sudah ada (dari cache/sesi sebelumnya) — biarkan apa adanya.
   await Promise.all([
     (async ()=>{
       try{
         const p = await Storage.get('pegawai-list', true);
-        state.pegawai = p ? JSON.parse(p.value) : [];
-      }catch(e){ state.pegawai = []; }
+        if(p && p.value){ state.pegawai = JSON.parse(p.value); }
+      }catch(e){ /* pertahankan data pegawai yang sudah ada, jangan dikosongkan */ }
     })(),
     (async ()=>{
       try{
         const pl = await Storage.get('periode-list', true);
-        state.periodeList = pl ? JSON.parse(pl.value) : [];
-      }catch(e){ state.periodeList = []; }
+        if(pl && pl.value){
+          const parsed = JSON.parse(pl.value);
+          if(Array.isArray(parsed) && parsed.length>0) state.periodeList = parsed;
+        }
+      }catch(e){ /* pertahankan daftar periode yang sudah ada */ }
       if(state.periodeList.length===0){
         const now = new Date();
         state.periodeList = [now.toLocaleString('id-ID',{month:'long',year:'numeric'})];
       }
-      state.periode = state.periodeList[state.periodeList.length-1];
+      if(!state.periode || !state.periodeList.includes(state.periode)){
+        state.periode = state.periodeList[state.periodeList.length-1];
+      }
     })(),
     (async ()=>{
       try{
         const u = await Storage.get('unit-list', true);
-        state.units = u ? JSON.parse(u.value) : [];
-      }catch(e){ state.units = []; }
-      if(state.units.length>0) state.currentUnitId = state.units[0].id;
+        if(u && u.value){ state.units = JSON.parse(u.value); }
+      }catch(e){ /* pertahankan data unit yang sudah ada, jangan dikosongkan */ }
+      if(state.units.length>0 && !state.currentUnitId) state.currentUnitId = state.units[0].id;
     })(),
     (async ()=>{
       try{
@@ -595,7 +609,7 @@ async function loadPenilaianForPeriode(periode){
     const list = await Storage.list('penilaian:'+periode+':', true);
     if(list && list.keys && list.keys.length>0){
       // Ambil semua data penilaian periode ini SEKALIGUS (maks 20 bersamaan) — bukan satu per satu.
-      await mapLimit(list.keys, 20, async (k)=>{
+      await mapLimit(list.keys, 10, async (k)=>{
         try{
           const r = await Storage.get(k, true);
           if(r){
@@ -608,29 +622,39 @@ async function loadPenilaianForPeriode(periode){
   }catch(e){}
 }
 
+/** Antrean penyimpanan per-key: memastikan penyimpanan berjalan berurutan (bukan berebutan/bersamaan),
+ * supaya perubahan yang lebih baru tidak pernah tertimpa oleh penyimpanan lama yang selesai belakangan. */
+const _saveQueues = {};
+function queuedSave(queueKey, saveFn){
+  const prev = _saveQueues[queueKey] || Promise.resolve();
+  const next = prev.then(saveFn).catch(err=>{ console.error('Gagal menyimpan ('+queueKey+'):', err); });
+  _saveQueues[queueKey] = next;
+  return next;
+}
+
 async function savePegawaiList(){
-  await Storage.set('pegawai-list', JSON.stringify(state.pegawai), true);
+  return queuedSave('pegawai-list', ()=>Storage.set('pegawai-list', JSON.stringify(state.pegawai), true));
 }
 async function savePeriodeList(){
-  await Storage.set('periode-list', JSON.stringify(state.periodeList), true);
+  return queuedSave('periode-list', ()=>Storage.set('periode-list', JSON.stringify(state.periodeList), true));
 }
 async function saveUnitList(){
-  await Storage.set('unit-list', JSON.stringify(state.units), true);
+  return queuedSave('unit-list', ()=>Storage.set('unit-list', JSON.stringify(state.units), true));
 }
 async function saveWeightConfig(){
-  await Storage.set('bobot-config', JSON.stringify({weight:state.weight, tiers:state.tiers, subWeight:state.subWeight, perUnitWeight:state.perUnitWeight}), true);
+  return queuedSave('bobot-config', ()=>Storage.set('bobot-config', JSON.stringify({weight:state.weight, tiers:state.tiers, subWeight:state.subWeight, perUnitWeight:state.perUnitWeight}), true));
 }
 async function saveAspekConfig(){
-  await Storage.set('aspek-config', JSON.stringify(state.aspekConfig), true);
+  return queuedSave('aspek-config', ()=>Storage.set('aspek-config', JSON.stringify(state.aspekConfig), true));
 }
 async function saveSikapThresholds(){
-  await Storage.set('sikap-thresholds', JSON.stringify(state.sikapThresholds), true);
+  return queuedSave('sikap-thresholds', ()=>Storage.set('sikap-thresholds', JSON.stringify(state.sikapThresholds), true));
 }
 async function saveAdminSecurity(){
-  await Storage.set('admin-security', JSON.stringify({pin: state.adminPin, superPin: state.superAdminPin, hrdPin: state.hrdPin}), true);
+  return queuedSave('admin-security', ()=>Storage.set('admin-security', JSON.stringify({pin: state.adminPin, superPin: state.superAdminPin, hrdPin: state.hrdPin}), true));
 }
 async function saveAbsensiConfig(){
-  await Storage.set('absensi-config', JSON.stringify({geofence: state.geofence, shiftConfig: state.shiftConfig, shiftDefs: state.shiftDefs}), true);
+  return queuedSave('absensi-config', ()=>Storage.set('absensi-config', JSON.stringify({geofence: state.geofence, shiftConfig: state.shiftConfig, shiftDefs: state.shiftDefs}), true));
 }
 
 /* ============ ABSEN MANDIRI: GPS + SIDIK JARI (WebAuthn) ============ */
