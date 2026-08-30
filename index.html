@@ -520,6 +520,18 @@ function pnKey(periode, pegawaiId){ return periode+'::'+pegawaiId; }
 
 /* ============ STORAGE ============ */
 /** Menjalankan banyak tugas async secara paralel dengan batas jumlah bersamaan (supaya tidak membanjiri server). */
+/** Pembuat ID unik yang AMAN dari bentrokan, termasuk saat membuat ratusan ID sekaligus dalam satu proses
+ * (mis. impor massal Excel). Sebelumnya pakai Date.now()+angka acak kecil — itu SANGAT rawan bentrok kalau
+ * ratusan dibuat dalam waktu bersamaan (mirip "kembar ulang tahun"), dan itulah penyebab bug data pegawai tertukar. */
+let _idFallbackCounter = 0;
+function generateId(prefix){
+  if(typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'){
+    return prefix+'_'+crypto.randomUUID();
+  }
+  _idFallbackCounter = (_idFallbackCounter + 1) % 1000000;
+  return prefix+'_'+Date.now()+'_'+_idFallbackCounter+'_'+Math.random().toString(36).slice(2,10);
+}
+
 async function mapLimit(items, limit, fn){
   const results = new Array(items.length);
   let idx = 0;
@@ -833,6 +845,25 @@ function getCurrentLocation(){
     );
   });
 }
+/** Ambil lokasi dengan dua sampel berjarak singkat untuk mendeteksi indikasi lokasi palsu (bukan 100% pasti,
+ * tapi GPS asli selalu sedikit bergeser antar-pembacaan — sedangkan banyak aplikasi fake GPS memberi
+ * koordinat statis yang persis identik terus-menerus). Menambah sedikit waktu tunggu (~1 detik) demi ini. */
+async function getLocationWithSpoofCheck(){
+  const loc1 = await getCurrentLocation();
+  await new Promise(res=>setTimeout(res, 900));
+  const loc2 = await getCurrentLocation();
+  const flags = [];
+  if(loc1.lat===loc2.lat && loc1.lng===loc2.lng){
+    flags.push('Koordinat tidak bergeser sama sekali antar-pembacaan (±1 detik) — GPS asli biasanya sedikit berubah.');
+  }
+  if(loc2.akurasi!=null && loc2.akurasi < 3){
+    flags.push('Akurasi GPS tidak wajar tinggi ('+loc2.akurasi.toFixed(1)+' m).');
+  }
+  if(loc2.akurasi!=null && loc2.akurasi > 1000){
+    flags.push('Akurasi GPS sangat buruk ('+Math.round(loc2.akurasi)+' m) — sinyal lemah atau tidak wajar.');
+  }
+  return { lat:loc2.lat, lng:loc2.lng, akurasi:loc2.akurasi, suspicious: flags.length>0, flags };
+}
 function distanceMeters(lat1,lng1,lat2,lng2){
   const R=6371000, toRad=d=>d*Math.PI/180;
   const dLat=toRad(lat2-lat1), dLng=toRad(lng2-lng1);
@@ -852,7 +883,7 @@ async function saveAbsensiLog(pegawaiId, dateISO, data){
 async function doAbsen(pegawaiId, jenis){ // jenis: 'masuk' | 'pulang'
   const dateISO = todayISO();
   const logPromise = getAbsensiLog(pegawaiId, dateISO); // mulai diambil dari sekarang, berbarengan dengan proses GPS & verifikasi di bawah (tidak saling bergantung)
-  const loc = await getCurrentLocation();
+  const loc = await getLocationWithSpoofCheck();
   if(state.geofence.lat!=null && state.geofence.lng!=null){
     const jarak = distanceMeters(loc.lat, loc.lng, state.geofence.lat, state.geofence.lng);
     if(jarak > state.geofence.radius){
@@ -864,7 +895,8 @@ async function doAbsen(pegawaiId, jenis){ // jenis: 'masuk' | 'pulang'
   const log = await logPromise; // pada titik ini biasanya sudah selesai duluan (GPS & verifikasi biasanya lebih lama)
   const now = new Date();
   const jam = now.toTimeString().slice(0,5);
-  log[jenis] = { jam, lat:loc.lat, lng:loc.lng };
+  // catatan kecurigaan TIDAK ditampilkan ke pegawai sendiri — hanya untuk peninjauan HRD/Admin nanti, supaya tidak "membocorkan" ke pelaku.
+  log[jenis] = { jam, lat:loc.lat, lng:loc.lng, akurasi:loc.akurasi, suspicious:loc.suspicious, suspicionFlags:loc.flags };
   await saveAbsensiLog(pegawaiId, dateISO, log);
   return log;
 }
@@ -906,6 +938,28 @@ async function getShiftForDate(pegawaiId, dateISO){
     if(def) return def;
   }
   return getShiftForPegawai(pegawaiId);
+}
+
+/** Pindai rentang tanggal untuk catatan absen yang ditandai mencurigakan (indikasi GPS palsu). */
+async function scanSuspiciousLogs(pegawaiId, startISO, endISO){
+  const start = new Date(startISO), end = new Date(endISO);
+  const dates = [];
+  for(let d=new Date(start); d<=end; d.setDate(d.getDate()+1)){
+    const iso = d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+    if(new Date(iso) > new Date(todayISO())) break;
+    dates.push(iso);
+  }
+  const results = await mapLimit(dates, 10, async (iso)=>{
+    const log = await getAbsensiLog(pegawaiId, iso);
+    const flagged = [];
+    ['masuk','pulang'].forEach(jenis=>{
+      if(log[jenis] && log[jenis].suspicious){
+        flagged.push({tanggal:iso, jenis, alasan: log[jenis].suspicionFlags||[]});
+      }
+    });
+    return flagged;
+  });
+  return results.flat();
 }
 
 async function computeAttendanceSummary(pegawaiId, startISO, endISO){
@@ -1606,7 +1660,7 @@ function renderUnitMaster(body){
   const newPw = el('input',{placeholder:'Kata sandi unit (opsional)',type:'text',style:'flex:1;'});
   const addBtn = el('button',{class:'btn btn-primary', onclick:()=>{
     if(!newInp.value.trim()){ return; }
-    const id = 'unit_'+Date.now();
+    const id = generateId('unit');
     state.units.push({id, nama:newInp.value.trim(), password:newPw.value.trim()||''});
     if(!state.currentUnitId) state.currentUnitId = id;
     newInp.value=''; newPw.value='';
@@ -1862,10 +1916,10 @@ function renderPegawaiAI(body){
         if(!row.nama.trim()) continue;
         let unit = state.units.find(u=>u.nama.toLowerCase()===row.unit.trim().toLowerCase()) || newUnits.find(u=>u.nama.toLowerCase()===row.unit.trim().toLowerCase());
         if(!unit && row.unit.trim()){
-          unit = {id:'unit_'+Date.now()+Math.floor(Math.random()*1000), nama:row.unit.trim(), password:''};
+          unit = {id:generateId('unit'), nama:row.unit.trim(), password:''};
           newUnits.push(unit);
         }
-        newPegawai.push({id:'peg_'+Date.now()+Math.floor(Math.random()*1000), nama:row.nama.trim(), unitId: unit?unit.id:null, jabatan:row.jabatan.trim()||'-', tukin_maks:row.tukin||0, shiftKey:row.shiftKey||''});
+        newPegawai.push({id:generateId('peg'), nama:row.nama.trim(), unitId: unit?unit.id:null, jabatan:row.jabatan.trim()||'-', tukin_maks:row.tukin||0, shiftKey:row.shiftKey||''});
       }
       state.units.push(...newUnits);
       state.pegawai.push(...newPegawai);
@@ -2404,6 +2458,47 @@ function buildRolePinPanel(roleKey, roleLabel, icon){
 }
 
 function renderPengaturan(body){
+  /* Perbaikan ID Duplikat — repair data lama yang mungkin rusak akibat bug generator ID sebelum diperbaiki */
+  const dupPegawai = {};
+  state.pegawai.forEach(p=>{ dupPegawai[p.id] = (dupPegawai[p.id]||0)+1; });
+  const dupPegawaiIds = Object.keys(dupPegawai).filter(id=>dupPegawai[id]>1);
+  const dupUnit = {};
+  state.units.forEach(u=>{ dupUnit[u.id] = (dupUnit[u.id]||0)+1; });
+  const dupUnitIds = Object.keys(dupUnit).filter(id=>dupUnit[id]>1);
+  const totalDup = dupPegawaiIds.length + dupUnitIds.length;
+
+  if(totalDup>0){
+    const panelRepair = el('div',{class:'panel',style:'border-color:var(--red);'});
+    panelRepair.appendChild(el('h3',{style:'color:var(--red);'},['⚠️ Ditemukan ID Bentrok/Duplikat']));
+    panelRepair.appendChild(el('div',{class:'warn-note'},[
+      'Terdeteksi '+dupPegawaiIds.length+' ID pegawai dan '+dupUnitIds.length+' ID unit yang dipakai lebih dari satu data sekaligus (kemungkinan besar dari impor massal sebelumnya) — ini bisa menyebabkan data pegawai/unit tertukar atau salah tampil. Klik tombol di bawah untuk memberikan ID baru yang unik ke data-data yang bentrok tersebut. Data (nama, unit, dsb.) TIDAK akan hilang, hanya ID di baliknya yang diperbaiki.'
+    ]));
+    panelRepair.appendChild(el('button',{class:'btn',style:'background:var(--red);color:#fff;', onclick: async ()=>{
+      if(!confirm('Perbaiki '+totalDup+' ID yang bentrok sekarang? Proses ini aman dan tidak menghapus data.')) return;
+      // Untuk tiap ID pegawai yang bentrok: pertahankan entri PERTAMA, beri ID baru untuk entri ke-2 dst.
+      const seenPeg = new Set();
+      state.pegawai.forEach(p=>{
+        if(seenPeg.has(p.id)){ p.id = generateId('peg'); }
+        seenPeg.add(p.id);
+      });
+      const seenUnit = new Set();
+      const unitIdRemap = {}; // id lama -> id baru, untuk perbaiki referensi unitId di pegawai
+      state.units.forEach(u=>{
+        if(seenUnit.has(u.id)){ const oldId=u.id; u.id = generateId('unit'); unitIdRemap[oldId]=u.id; }
+        seenUnit.add(u.id);
+      });
+      // Perbaiki juga referensi unitId di data pegawai yang tadinya menunjuk ke ID unit yang baru saja diganti
+      if(Object.keys(unitIdRemap).length>0){
+        state.pegawai.forEach(p=>{ if(p.unitId && unitIdRemap[p.unitId]) p.unitId = unitIdRemap[p.unitId]; });
+      }
+      rerender();
+      bgSave(savePegawaiList()); bgSave(saveUnitList());
+      alert('✓ Perbaikan selesai: '+dupPegawaiIds.length+' ID pegawai dan '+dupUnitIds.length+' ID unit sudah diberi ID baru yang unik.');
+    }},['🔧 Perbaiki Sekarang ('+totalDup+' bentrok)']));
+    body.appendChild(panelRepair);
+  }
+
+
   /* Diagnostik Koneksi Server */
   if(STORAGE_MODE==='gas'){
     const panelDiag = el('div',{class:'panel',style:'border-color:var(--gold);'});
@@ -2823,7 +2918,7 @@ function buildAddPegawaiModal(modal){
     el('button',{class:'btn btn-outline', onclick:()=>{state.modal=null; rerender();}},['Batal']),
     el('button',{class:'btn btn-primary', onclick:()=>{
       if(!nama.value.trim()){ alert('Nama wajib diisi'); return; }
-      const id = 'peg_'+Date.now();
+      const id = generateId('peg');
       state.pegawai.push({id, nama:nama.value.trim(), unitId:unitSel.value, jabatan:jabatan.value.trim()||'-', tukin_maks:tukin.value||0, shiftKey:shiftSel.value||''});
       state.modal=null;
       rerender();
@@ -2985,6 +3080,29 @@ function buildValidasiHRDModal(modal){
     modal.appendChild(row);
   });
   modal.appendChild(el('div',{class:'small-note'},['Rata-rata Sikap Kerja: '+f.sikapAvg.toFixed(2)+' / 4 ('+SCORE_LABEL[Math.round(f.sikapAvg)]+'). Aspek bertanda "otomatis" bersumber langsung dari data absensi dan tidak dapat diubah manual; aspek bertanda "input unit" dinilai oleh Kepala Unit. HRD memastikan kesesuaian keduanya dengan catatan kepegawaian.']));
+
+  // Peringatan indikasi lokasi palsu — dimuat async, hanya terlihat oleh HRD (tidak pernah ditampilkan ke pegawai sendiri)
+  const suspicionBox = el('div',{id:'hrd-suspicion-box'},[el('div',{class:'small-note'},['Memeriksa indikasi lokasi palsu pada absen mandiri…'])]);
+  modal.appendChild(suspicionBox);
+  (async ()=>{
+    const now = new Date();
+    const firstDay = now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-01';
+    const flagged = await scanSuspiciousLogs(p.id, firstDay, todayISO());
+    const box = document.getElementById('hrd-suspicion-box');
+    if(!box) return; // modal sudah ditutup sebelum selesai memuat
+    box.innerHTML = '';
+    if(flagged.length===0){
+      box.appendChild(el('div',{class:'small-note'},['✓ Tidak ada indikasi lokasi palsu pada absen mandiri bulan ini.']));
+    } else {
+      const warnBox = el('div',{style:'background:var(--red-soft);color:var(--red);padding:10px 12px;border-radius:8px;font-size:12px;margin-top:4px;'});
+      warnBox.appendChild(el('div',{style:'font-weight:700;margin-bottom:6px;'},['🚩 Indikasi lokasi palsu terdeteksi ('+flagged.length+' kejadian) — mohon ditinjau sebelum menyetujui:']));
+      flagged.slice(0,8).forEach(f=>{
+        warnBox.appendChild(el('div',{style:'margin-top:4px;'},['• '+f.tanggal+' ('+(f.jenis==='masuk'?'Absen Masuk':'Absen Pulang')+'): '+f.alasan.join('; ')]));
+      });
+      if(flagged.length>8) warnBox.appendChild(el('div',{style:'margin-top:4px;font-style:italic;'},['...dan '+(flagged.length-8)+' kejadian lainnya.']));
+      box.appendChild(warnBox);
+    }
+  })();
 
   const catatan = el('textarea',{rows:'2',placeholder:'Catatan validasi (wajib diisi jika mengembalikan untuk revisi)'});
   modal.appendChild(el('div',{class:'field',style:'margin-top:12px;'},[el('label',null,['Catatan HRD']), catatan]));
