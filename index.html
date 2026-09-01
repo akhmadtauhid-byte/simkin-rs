@@ -1046,6 +1046,11 @@ function getPenilaian(periode, pegawaiId){
   }
   return state.penilaian[k];
 }
+/** Hapus/reset total penilaian seorang pegawai untuk periode tertentu — kembali kosong seolah belum pernah diisi. */
+async function deletePenilaian(periode, pegawaiId){
+  await Storage.delete('penilaian:'+periode+':'+pegawaiId, true);
+  delete state.penilaian[pnKey(periode, pegawaiId)];
+}
 
 /* ============ SCORING LOGIC ============ */
 function tierScore(value, t){
@@ -2936,6 +2941,29 @@ function buildInputPenilaianModal(modal){
     el('div',null,[el('h3',null,[p.nama]), el('div',{class:'sub',style:'color:var(--ink-soft);font-size:11.5px;margin-top:3px;'},[unitName(p.unitId)+' · '+p.jabatan])]),
     el('button',{class:'x-btn', onclick:()=>{state.modal=null; rerender();}},['✕'])
   ]));
+
+  // Tombol hapus/reset — Admin selalu bisa (untuk semua status); Kepala Unit hanya untuk status yang masih bisa diedit (belum divalidasi).
+  const canDeletePenilaian = state.role==='admin' || editable;
+  if(canDeletePenilaian){
+    const delRow = el('div',{style:'display:flex;justify-content:flex-end;margin-bottom:10px;'});
+    delRow.appendChild(el('button',{class:'btn btn-outline btn-sm',style:'color:var(--red);border-color:var(--red);', onclick: async ()=>{
+      const isFinal = pn.status==='FINAL';
+      const msg = isFinal
+        ? 'Penilaian ini sudah FINAL dan menjadi dasar tukin. Yakin ingin MENGHAPUS TOTAL dan mengembalikannya ke kosong? Tindakan ini tidak bisa dibatalkan.'
+        : 'Hapus seluruh isi penilaian '+p.nama+' untuk periode '+state.periode+'? Semua skor dan status yang sudah diisi akan kembali kosong. Tindakan ini tidak bisa dibatalkan.';
+      if(!confirm(msg)) return;
+      if(isFinal && !confirm('Konfirmasi sekali lagi: penilaian FINAL ini akan dihapus permanen. Lanjutkan?')) return;
+      try{
+        await deletePenilaian(state.periode, p.id);
+        state.modal = null;
+        rerender();
+        alert('✓ Penilaian '+p.nama+' berhasil dihapus/direset.');
+      }catch(err){
+        alert('❌ Gagal menghapus penilaian dari server: '+(err&&err.message||err));
+      }
+    }},['🗑️ Hapus / Reset Penilaian']));
+    modal.appendChild(delRow);
+  }
 
   if(pn.status==='REVISI_HRD') modal.appendChild(el('div',{class:'warn-note'},['Dikembalikan oleh HRD: '+(pn.catatan_hrd||'-')]));
   if(pn.status==='REVISI_DIKLAT') modal.appendChild(el('div',{class:'warn-note'},['Dikembalikan oleh Diklat: '+(pn.catatan_diklat||'-')]));
