@@ -723,6 +723,39 @@ function queuedSave(queueKey, saveFn){
 async function savePegawaiList(){
   return queuedSave('pegawai-list', ()=>Storage.set('pegawai-list', JSON.stringify(state.pegawai), true));
 }
+/** Simpan perubahan HANYA SATU pegawai dengan pola ambil-gabung-simpan: ambil dulu daftar TERBARU dari
+ * server, timpa/tambahkan cuma record pegawai yang memang baru diubah sesi ini, baru simpan gabungannya.
+ * Ini mencegah edit satu pegawai (mis. ganti unit/shift) menimpa balik data pegawai LAIN yang sudah
+ * berubah di server sejak sesi ini terakhir memuat data — termasuk mengembalikan Tukin yang sudah dihapus. */
+async function savePegawaiSingle(pegawaiId){
+  return queuedSave('pegawai-list', async ()=>{
+    let serverList = state.pegawai;
+    try{
+      const r = await Storage.get('pegawai-list', true);
+      if(r && r.value) serverList = JSON.parse(r.value);
+    }catch(e){ /* kalau gagal ambil versi server, pakai data lokal sebagai fallback terakhir */ }
+    const localRecord = state.pegawai.find(p=>p.id===pegawaiId);
+    if(localRecord){
+      const idx = serverList.findIndex(p=>p.id===pegawaiId);
+      if(idx>=0) serverList[idx] = localRecord; else serverList.push(localRecord);
+    }
+    await Storage.set('pegawai-list', JSON.stringify(serverList), true);
+    state.pegawai = serverList; // sinkronkan tampilan sesi ini dengan hasil gabungan (termasuk perubahan orang lain)
+  });
+}
+/** Hapus HANYA SATU pegawai dengan pola ambil-gabung-simpan yang sama. */
+async function deletePegawaiSingle(pegawaiId){
+  return queuedSave('pegawai-list', async ()=>{
+    let serverList = state.pegawai;
+    try{
+      const r = await Storage.get('pegawai-list', true);
+      if(r && r.value) serverList = JSON.parse(r.value);
+    }catch(e){}
+    serverList = serverList.filter(p=>p.id!==pegawaiId);
+    await Storage.set('pegawai-list', JSON.stringify(serverList), true);
+    state.pegawai = serverList;
+  });
+}
 async function savePeriodeList(){
   return queuedSave('periode-list', ()=>Storage.set('periode-list', JSON.stringify(state.periodeList), true));
 }
@@ -731,6 +764,23 @@ async function saveUnitList(){
 }
 async function saveWeightConfig(){
   return queuedSave('bobot-config', ()=>Storage.set('bobot-config', JSON.stringify({weight:state.weight, tiers:state.tiers, subWeight:state.subWeight, perUnitWeight:state.perUnitWeight}), true));
+}
+/** Simpan HANYA satu bagian (weight/tiers/subWeight/perUnitWeight) dengan pola ambil-gabung-simpan:
+ * ambil dulu versi TERBARU dari server, timpa cuma bagian yang memang baru diubah sesi ini, baru simpan.
+ * Ini mencegah sesi yang "ketinggalan" (tab lama terbuka) tanpa sadar menimpa balik perubahan bagian LAIN
+ * yang sudah dibuat orang lain lebih baru — inilah penyebab bobot/tier "berubah sendiri". */
+async function saveWeightConfigField(fieldName){
+  return queuedSave('bobot-config', async ()=>{
+    let fresh = {weight:DEFAULT_WEIGHT, tiers:DEFAULT_TIERS, subWeight:DEFAULT_SUBWEIGHT, perUnitWeight:{}};
+    try{
+      const r = await Storage.get('bobot-config', true);
+      if(r && r.value) fresh = {...fresh, ...JSON.parse(r.value)};
+    }catch(e){ /* kalau gagal ambil versi server, pakai default sebagai basis supaya tidak menimpa dengan data lokal yang mungkin usang */ }
+    fresh[fieldName] = state[fieldName]; // timpa HANYA bagian yang memang baru diubah di sesi ini
+    await Storage.set('bobot-config', JSON.stringify(fresh), true);
+    // sinkronkan balik bagian LAIN (yang mungkin sudah diubah orang lain) ke tampilan sesi ini, supaya konsisten
+    state.weight = fresh.weight; state.tiers = fresh.tiers; state.subWeight = fresh.subWeight; state.perUnitWeight = fresh.perUnitWeight;
+  });
 }
 async function saveAspekConfig(){
   return queuedSave('aspek-config', ()=>Storage.set('aspek-config', JSON.stringify(state.aspekConfig), true));
@@ -1714,7 +1764,7 @@ function renderUnitMaster(body){
             delete state.unitAuth[u.id];
             state.unitSaveConfirm = null;
             rerender();
-            bgSave(saveUnitList()); bgSave(saveWeightConfig());
+            bgSave(saveUnitList()); bgSave(saveWeightConfigField('perUnitWeight'));
           }
         }},['Hapus'])])
       ]));
@@ -1751,7 +1801,7 @@ function renderPegawai(body){
       unitSel.addEventListener('change', e=>{
         p.unitId = e.target.value || null;
         rerender();
-        bgSave(savePegawaiList());
+        bgSave(savePegawaiSingle(p.id));
       });
       const shiftSel = el('select',{style:'padding:5px 7px;border:1px solid var(--line);border-radius:6px;font-size:12px;'});
       shiftSel.appendChild(el('option',{value:''},['— Default —']));
@@ -1762,7 +1812,7 @@ function renderPegawai(body){
       });
       shiftSel.addEventListener('change', e=>{
         p.shiftKey = e.target.value;
-        bgSave(savePegawaiList());
+        bgSave(savePegawaiSingle(p.id));
       });
       table.appendChild(el('tr',null,[
         el('td',null,[p.nama]), el('td',null,[unitSel]), el('td',null,[p.jabatan]),
@@ -1774,7 +1824,7 @@ function renderPegawai(body){
             if(confirm('Hapus pegawai '+p.nama+'?')){
               state.pegawai = state.pegawai.filter(x=>x.id!==p.id);
               rerender();
-              bgSave(savePegawaiList());
+              bgSave(deletePegawaiSingle(p.id));
             }
           }},['Hapus'])
         ])
@@ -2295,7 +2345,7 @@ function renderAspekMaster(body){
         if(confirm(msg)){
           removeAspek(cd.key, a.key);
           rerender();
-          bgSave(saveAspekConfig()); bgSave(saveWeightConfig());
+          bgSave(saveAspekConfig()); bgSave(saveWeightConfigField('subWeight'));
         }
       }},['Hapus']));
       row.appendChild(top);
@@ -2313,7 +2363,7 @@ function renderAspekMaster(body){
       addAspek(cd.key, newNama.value, newDesc.value, 'manual');
       newNama.value=''; newDesc.value='';
       rerender();
-      bgSave(saveAspekConfig()); bgSave(saveWeightConfig());
+      bgSave(saveAspekConfig()); bgSave(saveWeightConfigField('subWeight'));
     }},['+ Tambah Aspek']);
     addRow.appendChild(newNama); addRow.appendChild(newDesc); addRow.appendChild(addBtn);
     panel.appendChild(addRow);
@@ -2743,7 +2793,7 @@ function renderPengaturan(body){
     const wrap = el('div',{class:'field'},[el('label',null,[label])]);
     const inp = el('input',{type:'number',min:'0',max:'100',value:state.weight[key]});
     inp.className='weight-input';
-    inp.addEventListener('change',(e)=>{ state.weight[key]=Number(e.target.value); rerender(); bgSave(saveWeightConfig()); });
+    inp.addEventListener('change',(e)=>{ state.weight[key]=Number(e.target.value); rerender(); bgSave(saveWeightConfigField('weight')); });
     wrap.appendChild(inp);
     return wrap;
   };
@@ -2766,7 +2816,7 @@ function renderPengaturan(body){
     aspekList.forEach(a=>{
       const wrap = el('div',{class:'field'},[el('label',null,[a.nama])]);
       const inp = el('input',{type:'number',min:'0',max:'100',value:state.subWeight[compKey][a.key],class:'weight-input'});
-      inp.addEventListener('change',(e)=>{ state.subWeight[compKey][a.key]=Number(e.target.value); rerender(); bgSave(saveWeightConfig()); });
+      inp.addEventListener('change',(e)=>{ state.subWeight[compKey][a.key]=Number(e.target.value); rerender(); bgSave(saveWeightConfigField('subWeight')); });
       wrap.appendChild(inp);
       subRow.appendChild(wrap);
     });
@@ -2803,7 +2853,7 @@ function renderPengaturan(body){
           if(!state.perUnitWeight[u.id]) state.perUnitWeight[u.id]={enabled:ov.enabled,sikap:ov.sikap,kinerja:ov.kinerja,mutu:ov.mutu};
           state.perUnitWeight[u.id][key]=Number(e.target.value);
           rerender();
-          bgSave(saveWeightConfig());
+          bgSave(saveWeightConfigField('perUnitWeight'));
         });
         wrap.appendChild(inp);
         return wrap;
@@ -2819,7 +2869,7 @@ function renderPengaturan(body){
         if(!state.perUnitWeight[u.id]) state.perUnitWeight[u.id]={enabled:false,sikap:state.weight.sikap,kinerja:state.weight.kinerja,mutu:state.weight.mutu};
         state.perUnitWeight[u.id].enabled = e.target.checked;
         rerender();
-        bgSave(saveWeightConfig());
+        bgSave(saveWeightConfigField('perUnitWeight'));
       });
 
       panelUnit.appendChild(box);
@@ -2833,9 +2883,9 @@ function renderPengaturan(body){
   table.appendChild(el('tr',null,[el('th',null,['Grade']),el('th',null,['Skor Minimal (%)']),el('th',null,['% Tukin Diterima'])]));
   state.tiers.forEach((tier,i)=>{
     const minInp = el('input',{type:'number',value:tier.min,class:'weight-input'});
-    minInp.addEventListener('change',(e)=>{ state.tiers[i].min=Number(e.target.value); rerender(); bgSave(saveWeightConfig()); });
+    minInp.addEventListener('change',(e)=>{ state.tiers[i].min=Number(e.target.value); rerender(); bgSave(saveWeightConfigField('tiers')); });
     const pctInp = el('input',{type:'number',value:tier.persen,class:'weight-input'});
-    pctInp.addEventListener('change',(e)=>{ state.tiers[i].persen=Number(e.target.value); rerender(); bgSave(saveWeightConfig()); });
+    pctInp.addEventListener('change',(e)=>{ state.tiers[i].persen=Number(e.target.value); rerender(); bgSave(saveWeightConfigField('tiers')); });
     table.appendChild(el('tr',null,[el('td',null,[gradeBadge(tier.grade)]), el('td',null,[minInp]), el('td',null,[pctInp])]));
   });
   panel2.appendChild(table);
@@ -2892,7 +2942,7 @@ function buildEditPegawaiModal(modal, pegawaiId){
       p.shiftKey = shiftSel.value||'';
       state.modal=null;
       rerender();
-      bgSave(savePegawaiList());
+      bgSave(savePegawaiSingle(p.id));
     }},['Simpan Perubahan'])
   ]));
 }
@@ -2927,7 +2977,7 @@ function buildAddPegawaiModal(modal){
       state.pegawai.push({id, nama:nama.value.trim(), unitId:unitSel.value, jabatan:jabatan.value.trim()||'-', tukin_maks:tukin.value||0, shiftKey:shiftSel.value||''});
       state.modal=null;
       rerender();
-      bgSave(savePegawaiList());
+      bgSave(savePegawaiSingle(id));
     }},['Simpan'])
   ]));
 }
