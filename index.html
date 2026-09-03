@@ -693,9 +693,22 @@ async function loadAll(){
 async function loadPenilaianForPeriode(periode){
   try{
     const list = await Storage.list('penilaian:'+periode+':', true);
-    if(list && list.keys && list.keys.length>0){
-      // Ambil semua data penilaian periode ini SEKALIGUS (maks 20 bersamaan) — bukan satu per satu.
-      await mapLimit(list.keys, 10, async (k)=>{
+    const existingKeys = new Set((list && list.keys) || []);
+
+    // PENTING: bersihkan entri LOKAL periode ini yang sudah tidak ada lagi di server
+    // (mis. sudah dihapus lewat sesi/perangkat lain) — supaya data yang sudah dihapus
+    // tidak "hidup lagi" gara-gara sisa cache lama yang belum sempat dibersihkan.
+    const prefix = periode+'::';
+    Object.keys(state.penilaian).forEach(k=>{
+      if(k.indexOf(prefix)===0){
+        const pegId = k.slice(prefix.length);
+        if(!existingKeys.has('penilaian:'+periode+':'+pegId)) delete state.penilaian[k];
+      }
+    });
+
+    if(existingKeys.size>0){
+      // Ambil semua data penilaian periode ini SEKALIGUS (maks 10 bersamaan) — bukan satu per satu.
+      await mapLimit([...existingKeys], 10, async (k)=>{
         try{
           const r = await Storage.get(k, true);
           if(r){
@@ -1258,9 +1271,9 @@ async function render(){
 
   const navItems = {
     pegawai_self:[['absen','👆','Absen Mandiri']],
-    unit:[['dashboard','◆','Dashboard'],['jadwal','📅','Jadwal Jaga'],['input','◆','Input Penilaian'],['input_ai','✨','Input Bulanan (AI)']],
-    hrd:[['dashboard','◆','Dashboard'],['validasi_hrd','◆','Validasi Sikap Kerja'],['validasi_diklat','◆','Validasi Kinerja & Mutu'],['pegawai','◆','Data Pegawai']],
-    admin:[['dashboard','◆','Dashboard'],['unit_master','◆','Data Unit'],['pegawai','◆','Data Pegawai'],['pegawai_ai','📊','Input Massal Pegawai'],['aspek_master','◆','Aspek Penilaian'],['jadwal','📅','Jadwal Jaga'],['input','◆','Input Penilaian'],['input_ai','✨','Input Bulanan (AI)'],['validasi_hrd','◆','Validasi Sikap Kerja'],['validasi_diklat','◆','Validasi Kinerja & Mutu'],['rekap','◆','Rekap & Tukin'],['pengaturan','◆','Pengaturan Bobot']],
+    unit:[['dashboard','◆','Dashboard'],['jadwal','📅','Jadwal Jaga'],['rekap_absensi','📥','Rekap Absensi'],['input','◆','Input Penilaian'],['input_ai','✨','Input Bulanan (AI)']],
+    hrd:[['dashboard','◆','Dashboard'],['validasi_hrd','◆','Validasi Sikap Kerja'],['validasi_diklat','◆','Validasi Kinerja & Mutu'],['rekap_absensi','📥','Rekap Absensi'],['pegawai','◆','Data Pegawai']],
+    admin:[['dashboard','◆','Dashboard'],['unit_master','◆','Data Unit'],['pegawai','◆','Data Pegawai'],['pegawai_ai','📊','Input Massal Pegawai'],['aspek_master','◆','Aspek Penilaian'],['jadwal','📅','Jadwal Jaga'],['rekap_absensi','📥','Rekap Absensi'],['input','◆','Input Penilaian'],['input_ai','✨','Input Bulanan (AI)'],['validasi_hrd','◆','Validasi Sikap Kerja'],['validasi_diklat','◆','Validasi Kinerja & Mutu'],['rekap','◆','Rekap & Tukin'],['pengaturan','◆','Pengaturan Bobot']],
   };
   const navRoleKey = state.role==='pegawai' ? 'pegawai_self' : state.role;
   const nav = el('div',{class:'nav'});
@@ -1283,6 +1296,7 @@ async function render(){
     input:['Input Penilaian','Sikap Kerja (absensi), Kinerja Pelayanan & Mutu Pelayanan — Unit '+unitName(state.currentUnitId)],
     input_ai:['Input Bulanan (AI)','Tempel catatan/laporan bulanan unit, AI bantu susun skor awal — Unit '+unitName(state.currentUnitId)],
     jadwal:['Jadwal Jaga','Atur shift kerja tiap pegawai per hari (shift bergilir) — Unit '+unitName(state.currentUnitId)],
+    rekap_absensi:['Rekap Absensi','Ringkasan kehadiran dari Absen Mandiri — bisa diunduh ke Excel'],
     pegawai_ai:['Input Massal Pegawai','Upload Excel untuk data besar (instan), atau tempel teks bebas dibantu AI'],
     aspek_master:['Aspek Penilaian','Sesuaikan daftar aspek penilaian dengan regulasi/akreditasi rumah sakit (KARS, dsb)'],
     absen:['Absen Mandiri','Verifikasi lokasi & sidik jari untuk absen masuk/pulang'],
@@ -1349,6 +1363,7 @@ async function renderTab(body){
   if(state.tab==='input') return renderInput(body);
   if(state.tab==='input_ai') return renderInputAI(body);
   if(state.tab==='jadwal') return renderJadwalJaga(body);
+  if(state.tab==='rekap_absensi') return renderRekapAbsensi(body);
   if(state.tab==='pegawai_ai') return renderPegawaiAI(body);
   if(state.tab==='aspek_master') return renderAspekMaster(body);
   if(state.tab==='absen') return renderAbsenMandiri(body);
@@ -2122,6 +2137,97 @@ async function runAIPenilaianBatch(staffList, narrative, pdfAttachment){
 
 /* ============ INPUT PENILAIAN (Kepala Unit) ============ */
 /* ============ JADWAL JAGA (kalender shift per hari, per pegawai — untuk shift bergilir/rolling) ============ */
+function exportRekapAbsensiExcel(rows, periode, unitLabel){
+  const data = [
+    ['REKAP ABSENSI MANDIRI — RSU ALLAM MEDICA'],
+    ['Unit: '+unitLabel],
+    ['Rentang: '+periode],
+    ['Diunduh: '+new Date().toLocaleString('id-ID')],
+    [],
+    ['Nama','Unit','Shift','% Hadir','Terlambat (kali)','Alpha (hari)','Hari Libur','Total Hari Kerja'],
+  ];
+  rows.forEach(r=>{
+    data.push([r.nama, r.unit, r.shiftNama, r.hadir_persen, r.terlambat, r.alpha, r.liburHari, r.totalHari]);
+  });
+  const ws = XLSX.utils.aoa_to_sheet(data);
+  ws['!cols'] = [{wch:26},{wch:16},{wch:16},{wch:10},{wch:14},{wch:12},{wch:11},{wch:16}];
+  ws['!merges'] = [{s:{r:0,c:0},e:{r:0,c:7}},{s:{r:1,c:0},e:{r:1,c:7}},{s:{r:2,c:0},e:{r:2,c:7}},{s:{r:3,c:0},e:{r:3,c:7}}];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Rekap Absensi');
+  XLSX.writeFile(wb, 'Rekap-Absensi-'+periode.replace(/\s+/g,'')+'.xlsx');
+}
+
+async function renderRekapAbsensi(body){
+  const isUnitRole = state.role==='unit';
+  const staffPool = isUnitRole ? state.pegawai.filter(p=>p.unitId===state.currentUnitId) : state.pegawai;
+
+  const panel = el('div',{class:'panel'});
+  const head = el('div',{style:'display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:10px;'});
+  head.appendChild(el('h3',{style:'margin:0;'},['Rekap Absensi'+(isUnitRole?' — '+unitName(state.currentUnitId):' — Semua Unit')]));
+  panel.appendChild(head);
+
+  const now = new Date();
+  const firstDay = now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-01';
+  const rangeRow = el('div',{style:'display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px;'});
+  const dStart = el('input',{type:'date', value:firstDay});
+  const dEnd = el('input',{type:'date', value:todayISO()});
+  rangeRow.appendChild(el('span',{style:'font-size:12px;color:var(--ink-soft);'},['Rentang:']));
+  rangeRow.appendChild(dStart);
+  rangeRow.appendChild(el('span',{style:'font-size:12px;color:var(--ink-soft);'},['s/d']));
+  rangeRow.appendChild(dEnd);
+  const loadBtn = el('button',{class:'btn btn-primary btn-sm'},['🔄 Tampilkan']);
+  const dlBtn = el('button',{class:'btn btn-outline btn-sm', style:'display:none;'},['💾 Unduh Excel']);
+  rangeRow.appendChild(loadBtn);
+  rangeRow.appendChild(dlBtn);
+  panel.appendChild(rangeRow);
+
+  const resultBox = el('div',{id:'rekap-absensi-result'});
+  panel.appendChild(resultBox);
+  body.appendChild(panel);
+
+  let lastRows = null;
+
+  async function loadAndRender(){
+    resultBox.innerHTML = '';
+    resultBox.appendChild(el('div',{class:'small-note'},['Menghitung rekap untuk '+staffPool.length+' pegawai…']));
+    if(staffPool.length===0){
+      resultBox.innerHTML = '';
+      resultBox.appendChild(el('div',{class:'empty'},['Belum ada pegawai'+(isUnitRole?' di unit ini':'')+'.']));
+      dlBtn.style.display='none';
+      return;
+    }
+    const rows = await mapLimit(staffPool, 8, async (p)=>{
+      const sum = await computeAttendanceSummary(p.id, dStart.value, dEnd.value);
+      return { nama:p.nama, unit:unitName(p.unitId), shiftNama:sum.shiftNama, hadir_persen:sum.hadir_persen, terlambat:sum.terlambat, alpha:sum.alpha, liburHari:sum.liburHari, totalHari:sum.totalHari };
+    });
+    lastRows = rows;
+    resultBox.innerHTML = '';
+    const table = el('table');
+    table.appendChild(el('tr',null,[
+      el('th',null,['Nama']),el('th',null,['Unit']),el('th',null,['Shift']),el('th',null,['% Hadir']),
+      el('th',null,['Terlambat']),el('th',null,['Alpha']),el('th',null,['Libur']),el('th',null,['Total Hari'])
+    ]));
+    rows.forEach(r=>{
+      table.appendChild(el('tr',null,[
+        el('td',null,[r.nama]), el('td',null,[r.unit]), el('td',null,[r.shiftNama]),
+        el('td',null,[r.hadir_persen+'%']), el('td',null,[String(r.terlambat)]), el('td',null,[String(r.alpha)]),
+        el('td',null,[String(r.liburHari)]), el('td',null,[String(r.totalHari)]),
+      ]));
+    });
+    resultBox.appendChild(table);
+    dlBtn.style.display = '';
+  }
+
+  loadBtn.addEventListener('click', loadAndRender);
+  dlBtn.addEventListener('click', ()=>{
+    if(!lastRows) return;
+    const periodeLabel = dStart.value+' s.d. '+dEnd.value;
+    exportRekapAbsensiExcel(lastRows, periodeLabel, isUnitRole?unitName(state.currentUnitId):'Semua Unit');
+  });
+
+  await loadAndRender(); // langsung tampil begitu halaman dibuka, dengan rentang default (awal bulan s/d hari ini)
+}
+
 async function renderJadwalJaga(body){
   if(state.units.length===0 || !state.currentUnitId){
     body.appendChild(el('div',{class:'panel'},[el('div',{class:'empty'},['Pilih unit terlebih dahulu di sidebar.'])]));
