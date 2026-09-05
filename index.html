@@ -943,9 +943,26 @@ async function getAbsensiLog(pegawaiId, dateISO){
 async function saveAbsensiLog(pegawaiId, dateISO, data){
   await Storage.set('absensi-log:'+pegawaiId+':'+dateISO, JSON.stringify(data), true);
 }
+function isoDateOffset(days){
+  const d = new Date(); d.setDate(d.getDate()+days);
+  return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+}
+/** Cari sesi absen yang masih "terbuka" (sudah masuk, belum pulang) — mendukung shift malam yang
+ * melewati tengah malam (mis. masuk jam 21:00, baru pulang besok jam 07:00). Kalau hari ini belum
+ * ada masuk sama sekali tapi KEMARIN ada masuk yang belum ditutup, itu dianggap sesi yang masih
+ * berjalan (bukan hari baru yang kosong), supaya Absen Pulang tercatat menyambung ke masuknya semalam. */
+async function getActiveAbsenSession(pegawaiId){
+  const today = todayISO();
+  const todayLog = await getAbsensiLog(pegawaiId, today);
+  if(todayLog.masuk) return {dateISO: today, log: todayLog};
+  const yISO = isoDateOffset(-1);
+  const yLog = await getAbsensiLog(pegawaiId, yISO);
+  if(yLog.masuk && !yLog.pulang) return {dateISO: yISO, log: yLog};
+  return {dateISO: today, log: todayLog};
+}
+
 async function doAbsen(pegawaiId, jenis){ // jenis: 'masuk' | 'pulang'
-  const dateISO = todayISO();
-  const logPromise = getAbsensiLog(pegawaiId, dateISO); // mulai diambil dari sekarang, berbarengan dengan proses GPS & verifikasi di bawah (tidak saling bergantung)
+  const sessionPromise = getActiveAbsenSession(pegawaiId); // mulai diambil dari sekarang, berbarengan dengan proses GPS & verifikasi di bawah
   const loc = await getLocationWithSpoofCheck();
   if(state.geofence.lat!=null && state.geofence.lng!=null){
     const jarak = distanceMeters(loc.lat, loc.lng, state.geofence.lat, state.geofence.lng);
@@ -955,11 +972,23 @@ async function doAbsen(pegawaiId, jenis){ // jenis: 'masuk' | 'pulang'
   }
   const verified = await verifyIdentityForAbsen(pegawaiId);
   if(!verified) throw new Error('Verifikasi identitas gagal.');
-  await logPromise; // biarkan pengambilan awal selesai (sudah berjalan sejak awal, berbarengan dengan GPS & verifikasi)
-  // Ambil ULANG log terbaru tepat sebelum menyimpan — memastikan sungguh-sungguh belum tercatat, mencegah dobel-tekan/kondisi balapan.
-  const log = await getAbsensiLog(pegawaiId, dateISO);
+  await sessionPromise; // biarkan pengambilan awal selesai (sudah berjalan sejak awal, berbarengan dengan GPS & verifikasi)
+  // Ambil ULANG sesi terbaru tepat sebelum menyimpan — memastikan sungguh-sungguh belum tercatat, mencegah dobel-tekan/kondisi balapan.
+  const session = await getActiveAbsenSession(pegawaiId);
+  let dateISO = session.dateISO, log = session.log;
+
+  if(jenis==='masuk' && session.dateISO===isoDateOffset(-1) && session.log.masuk && !session.log.pulang){
+    throw new Error('Anda masih memiliki sesi shift kemarin yang belum ditutup (Absen Masuk pukul '+session.log.masuk.jam+', belum Absen Pulang). Selesaikan Absen Pulang dulu sebelum Absen Masuk baru.');
+  }
+  if(jenis==='masuk'){
+    dateISO = todayISO(); // absen masuk baru selalu dicatat di tanggal hari ini
+    log = await getAbsensiLog(pegawaiId, dateISO);
+  }
+  if(jenis==='pulang' && !log.masuk){
+    throw new Error('Anda belum tercatat Absen Masuk untuk sesi ini — tidak bisa Absen Pulang.');
+  }
   if(log[jenis]){
-    throw new Error('Absen '+(jenis==='masuk'?'Masuk':'Pulang')+' hari ini SUDAH tercatat pukul '+log[jenis].jam+' dan terkunci — tidak bisa ditimpa lagi.');
+    throw new Error('Absen '+(jenis==='masuk'?'Masuk':'Pulang')+' untuk sesi ini SUDAH tercatat pukul '+log[jenis].jam+' dan terkunci — tidak bisa ditimpa lagi.');
   }
   const now = new Date();
   const jam = now.toTimeString().slice(0,5);
@@ -1513,23 +1542,28 @@ async function renderAbsenMandiri(body){
     panel.appendChild(buildPinCard(me));
   }
 
-  // Ambil status hari ini LEBIH DULU (sebelum tombol dibangun) — supaya kalau sudah absen, tombolnya
-  // langsung terlihat terkunci sejak awal, bukan baru terkunci setelah ditekan. Ini juga mencegah
-  // absen masuk/pulang yang sama tercatat dua kali (data tidak bisa "ditimpa" lagi setelah tersimpan).
-  const [todayLog, todayShift] = await Promise.all([
-    getAbsensiLog(me.id, todayISO()),
+  // Ambil status sesi aktif LEBIH DULU (sebelum tombol dibangun) — supaya kalau sudah absen, tombolnya
+  // langsung terlihat terkunci sejak awal, bukan baru terkunci setelah ditekan. Pakai sesi aktif (bukan
+  // cuma tanggal hari ini) supaya shift malam yang melewati tengah malam tetap terdeteksi dengan benar.
+  const [session, todayShift] = await Promise.all([
+    getActiveAbsenSession(me.id),
     getShiftForDate(me.id, todayISO()),
   ]);
-  const masukLocked = !!todayLog.masuk;
-  const pulangLocked = !!todayLog.pulang;
+  const sessionLog = session.log;
+  const isOvernightSession = session.dateISO !== todayISO();
+  const masukLocked = !!sessionLog.masuk; // kalau ada sesi aktif (hari ini ATAU sisa kemarin yang belum ditutup), Masuk terkunci
+  const pulangLocked = !!sessionLog.pulang;
 
   // sudah terdaftar — tampilkan status hari ini & tombol absen
   const todayBox = el('div',{style:'text-align:center;padding:16px;border:1px solid var(--line);border-radius:12px;margin-bottom:14px;'});
   todayBox.appendChild(el('div',{style:'font-size:11px;color:var(--ink-soft);text-transform:uppercase;letter-spacing:0.4px;'},['Hari ini, '+new Date().toLocaleDateString('id-ID',{weekday:'long',day:'numeric',month:'long'})]));
   todayBox.appendChild(el('div',{style:'font-size:11.5px;color:var(--gold);font-weight:700;margin-top:4px;'},[todayShift.libur ? '🛌 Hari ini libur' : '🕐 Shift: '+todayShift.nama+' ('+todayShift.jamMulai+(todayShift.jamSelesai?'–'+todayShift.jamSelesai:'')+')']));
+  if(isOvernightSession && sessionLog.masuk && !sessionLog.pulang){
+    todayBox.appendChild(el('div',{style:'font-size:11px;color:var(--teal);margin-top:2px;'},['🌙 Sesi shift malam kemarin masih berjalan, belum Absen Pulang']));
+  }
   const statusRow = el('div',{style:'display:flex;justify-content:center;gap:24px;margin-top:8px;'});
-  const masukEl = el('div',null,[el('div',{style:'font-size:10.5px;color:var(--ink-soft);'},['Masuk']), el('div',{style:'font-family:Lexend;font-weight:800;font-size:18px;color:'+(masukLocked?'var(--green)':'var(--teal)')+';'},[todayLog.masuk ? todayLog.masuk.jam : '—'])]);
-  const pulangEl = el('div',null,[el('div',{style:'font-size:10.5px;color:var(--ink-soft);'},['Pulang']), el('div',{style:'font-family:Lexend;font-weight:800;font-size:18px;color:'+(pulangLocked?'var(--green)':'var(--teal)')+';'},[todayLog.pulang ? todayLog.pulang.jam : '—'])]);
+  const masukEl = el('div',null,[el('div',{style:'font-size:10.5px;color:var(--ink-soft);'},['Masuk'+(isOvernightSession?' (kemarin)':'')]), el('div',{style:'font-family:Lexend;font-weight:800;font-size:18px;color:'+(masukLocked?'var(--green)':'var(--teal)')+';'},[sessionLog.masuk ? sessionLog.masuk.jam : '—'])]);
+  const pulangEl = el('div',null,[el('div',{style:'font-size:10.5px;color:var(--ink-soft);'},['Pulang']), el('div',{style:'font-family:Lexend;font-weight:800;font-size:18px;color:'+(pulangLocked?'var(--green)':'var(--teal)')+';'},[sessionLog.pulang ? sessionLog.pulang.jam : '—'])]);
   statusRow.appendChild(masukEl); statusRow.appendChild(pulangEl);
   todayBox.appendChild(statusRow);
   panel.appendChild(todayBox);
