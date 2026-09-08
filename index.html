@@ -2177,6 +2177,27 @@ async function runAIPenilaianBatch(staffList, narrative, pdfAttachment){
 
 /* ============ INPUT PENILAIAN (Kepala Unit) ============ */
 /* ============ JADWAL JAGA (kalender shift per hari, per pegawai — untuk shift bergilir/rolling) ============ */
+function exportJamKedatanganExcel(rows, tanggalLabel, unitLabel){
+  const data = [
+    ['REKAP JAM KEDATANGAN & PULANG — RSU ALLAM MEDICA'],
+    ['Unit: '+unitLabel],
+    ['Tanggal: '+tanggalLabel],
+    ['Diunduh: '+new Date().toLocaleString('id-ID')],
+    [],
+    ['Tanggal','Nama','Unit','Shift','Jam Masuk','Jam Pulang','Status'],
+  ];
+  rows.forEach(r=>{
+    const statusLabel = {libur:'Libur', ontime:'Tepat Waktu', telat:'Terlambat', alpha:'Belum Absen', '-':'-'}[r.statusMasuk] || r.statusMasuk;
+    data.push([r.tanggal||tanggalLabel, r.nama, r.unit, r.shiftNama, r.jamMasuk||'-', r.jamPulang||'-', statusLabel]);
+  });
+  const ws = XLSX.utils.aoa_to_sheet(data);
+  ws['!cols'] = [{wch:13},{wch:26},{wch:16},{wch:14},{wch:12},{wch:12},{wch:14}];
+  ws['!merges'] = [{s:{r:0,c:0},e:{r:0,c:6}},{s:{r:1,c:0},e:{r:1,c:6}},{s:{r:2,c:0},e:{r:2,c:6}},{s:{r:3,c:0},e:{r:3,c:6}}];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Jam Kedatangan');
+  XLSX.writeFile(wb, 'Jam-Kedatangan-'+tanggalLabel.replace(/[\s\/]+/g,'-')+'.xlsx');
+}
+
 function exportRekapAbsensiExcel(rows, periode, unitLabel){
   const data = [
     ['REKAP ABSENSI MANDIRI — RSU ALLAM MEDICA'],
@@ -2208,16 +2229,20 @@ async function renderRekapAbsensi(body){
   const jamDateRow = el('div',{style:'display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px;'});
   const jamDate = el('input',{type:'date', value:todayISO()});
   const jamBtn = el('button',{class:'btn btn-primary btn-sm'},['🔄 Tampilkan']);
+  const jamDlBtn = el('button',{class:'btn btn-outline btn-sm', style:'display:none;'},['💾 Unduh Excel']);
   jamDateRow.appendChild(el('span',{style:'font-size:12px;color:var(--ink-soft);'},['Tanggal:']));
   jamDateRow.appendChild(jamDate);
   jamDateRow.appendChild(jamBtn);
+  jamDateRow.appendChild(jamDlBtn);
   panelJam.appendChild(jamDateRow);
   const jamResult = el('div',{id:'jam-kedatangan-result'});
   panelJam.appendChild(jamResult);
   body.appendChild(panelJam);
 
+  let lastJamRows = null;
   async function loadJamKedatangan(){
     jamResult.innerHTML = '';
+    jamDlBtn.style.display = 'none';
     if(staffPool.length===0){
       jamResult.appendChild(el('div',{class:'empty'},['Belum ada pegawai'+(isUnitRole?' di unit ini':'')+'.']));
       return;
@@ -2235,8 +2260,10 @@ async function renderRekapAbsensi(body){
       } else if(new Date(dateVal) <= new Date(todayISO())) {
         statusMasuk = 'alpha';
       }
-      return { nama:p.nama, unit:unitName(p.unitId), jamMasuk: log.masuk?log.masuk.jam:null, jamPulang: log.pulang?log.pulang.jam:null, statusMasuk, shiftNama: shift.libur?'Libur':shift.nama };
+      return { tanggal:dateVal, nama:p.nama, unit:unitName(p.unitId), jamMasuk: log.masuk?log.masuk.jam:null, jamPulang: log.pulang?log.pulang.jam:null, statusMasuk, shiftNama: shift.libur?'Libur':shift.nama };
     });
+    lastJamRows = rows;
+    jamDlBtn.style.display = '';
     jamResult.innerHTML = '';
     const table = el('table');
     table.appendChild(el('tr',null,[el('th',null,['Nama']), el('th',null,['Unit']), el('th',null,['Shift']), el('th',null,['Jam Masuk']), el('th',null,['Jam Pulang']), el('th',null,['Status'])]));
@@ -2257,6 +2284,10 @@ async function renderRekapAbsensi(body){
     jamResult.appendChild(table);
   }
   jamBtn.addEventListener('click', loadJamKedatangan);
+  jamDlBtn.addEventListener('click', ()=>{
+    if(!lastJamRows) return;
+    exportJamKedatanganExcel(lastJamRows, jamDate.value, isUnitRole?unitName(state.currentUnitId):'Semua Unit');
+  });
   await loadJamKedatangan();
 
   const panel = el('div',{class:'panel'});
@@ -2274,10 +2305,13 @@ async function renderRekapAbsensi(body){
   rangeRow.appendChild(el('span',{style:'font-size:12px;color:var(--ink-soft);'},['s/d']));
   rangeRow.appendChild(dEnd);
   const loadBtn = el('button',{class:'btn btn-primary btn-sm'},['🔄 Tampilkan']);
-  const dlBtn = el('button',{class:'btn btn-outline btn-sm', style:'display:none;'},['💾 Unduh Excel']);
+  const dlBtn = el('button',{class:'btn btn-outline btn-sm', style:'display:none;'},['💾 Unduh Ringkasan (Excel)']);
+  const detailDlBtn = el('button',{class:'btn btn-outline btn-sm'},['📑 Unduh Detail Harian (Excel)']);
   rangeRow.appendChild(loadBtn);
   rangeRow.appendChild(dlBtn);
+  rangeRow.appendChild(detailDlBtn);
   panel.appendChild(rangeRow);
+  panel.appendChild(el('div',{class:'small-note',style:'margin-top:-8px;margin-bottom:12px;'},['"Unduh Detail Harian" berisi jam masuk & pulang tiap pegawai untuk SETIAP hari dalam rentang (cocok untuk arsip/lampiran bulanan) — bisa memakan waktu lebih lama untuk rentang panjang atau pegawai banyak.']));
 
   const resultBox = el('div',{id:'rekap-absensi-result'});
   panel.appendChild(resultBox);
@@ -2330,6 +2364,43 @@ async function renderRekapAbsensi(body){
     if(!lastRows) return;
     const periodeLabel = dStart.value+' s.d. '+dEnd.value;
     exportRekapAbsensiExcel(lastRows, periodeLabel, isUnitRole?unitName(state.currentUnitId):'Semua Unit');
+  });
+  detailDlBtn.addEventListener('click', async ()=>{
+    if(staffPool.length===0){ alert('Belum ada pegawai untuk direkap.'); return; }
+    const dates = [];
+    for(let d=new Date(dStart.value); d<=new Date(dEnd.value); d.setDate(d.getDate()+1)){
+      dates.push(d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'));
+    }
+    const tasks = [];
+    staffPool.forEach(p=>{ dates.forEach(dateVal=>{ tasks.push({p, dateVal}); }); });
+    if(tasks.length>3000 && !confirm('Kombinasi '+staffPool.length+' pegawai × '+dates.length+' hari cukup besar dan bisa memakan waktu beberapa menit. Lanjutkan?')) return;
+    detailDlBtn.disabled = true;
+    let done = 0;
+    detailDlBtn.textContent = 'Menyiapkan… (0/'+tasks.length+')';
+    try{
+      const allRows = await mapLimit(tasks, 15, async ({p, dateVal})=>{
+        const [log, shift] = await Promise.all([getAbsensiLog(p.id, dateVal), getShiftForDate(p.id, dateVal)]);
+        let statusMasuk = '-';
+        if(shift.libur) statusMasuk = 'libur';
+        else if(log.masuk){
+          const [jamH,menitH] = shift.jamMulai.split(':').map(Number);
+          const [jm,mm] = log.masuk.jam.split(':').map(Number);
+          statusMasuk = (jm*60+mm) > (jamH*60+menitH+shift.toleransiMenit) ? 'telat' : 'ontime';
+        } else if(new Date(dateVal) <= new Date(todayISO())) {
+          statusMasuk = 'alpha';
+        }
+        done++;
+        if(done % 20===0 || done===tasks.length) detailDlBtn.textContent = 'Menyiapkan… ('+done+'/'+tasks.length+')';
+        return { tanggal:dateVal, nama:p.nama, unit:unitName(p.unitId), shiftNama: shift.libur?'Libur':shift.nama, jamMasuk: log.masuk?log.masuk.jam:null, jamPulang: log.pulang?log.pulang.jam:null, statusMasuk };
+      });
+      // urutkan rapi: per tanggal, lalu per nama — supaya enak dibaca sebagai buku absen harian
+      allRows.sort((a,b)=> a.tanggal===b.tanggal ? a.nama.localeCompare(b.nama) : a.tanggal.localeCompare(b.tanggal));
+      exportJamKedatanganExcel(allRows, dStart.value+' s.d. '+dEnd.value, isUnitRole?unitName(state.currentUnitId):'Semua Unit');
+    }catch(err){
+      alert('❌ Gagal menyiapkan detail harian: '+(err&&err.message||err));
+    }
+    detailDlBtn.disabled = false;
+    detailDlBtn.textContent = '📑 Unduh Detail Harian (Excel)';
   });
 
   await loadAndRender(); // langsung tampil begitu halaman dibuka, dengan rentang default (awal bulan s/d hari ini)
