@@ -458,6 +458,9 @@ let state = {
   units: [], // {id, nama}
   currentUnitId: null,
   penilaian: {}, // key: periode|pegawaiId -> object
+  pengangkatan: {}, // key: pegawaiId -> { riwayat: [...] } — penilaian kelayakan pengangkatan pegawai tetap
+  searchQuery: '', // pencarian nama pegawai — dipakai bersama di berbagai layar (Rekap, Validasi, dll.)
+  searchUnitId: '', // filter unit kerja — dipakai bersama di berbagai layar
   weight: DEFAULT_WEIGHT,       // bobot komponen default (global)
   subWeight: DEFAULT_SUBWEIGHT, // bobot sub-aspek per komponen (global)
   aspekConfig: { sikap: JSON.parse(JSON.stringify(DEFAULT_SIKAP_ASPEK)), kinerja: JSON.parse(JSON.stringify(DEFAULT_KINERJA_ASPEK)), mutu: JSON.parse(JSON.stringify(DEFAULT_MUTU_ASPEK)) }, // daftar aspek penilaian per komponen — dapat ditambah/diubah admin
@@ -506,6 +509,41 @@ let state = {
 };
 
 function unitName(id){ const u = state.units.find(x=>x.id===id); return u? u.nama : '-'; }
+
+/** Bar pencarian nama pegawai + filter unit kerja — dipakai bersama di berbagai layar (Rekap, Validasi, Data Pegawai, dll.)
+ * supaya HRD/Admin bisa cepat menyaring & mengelompokkan pegawai yang jumlahnya banyak. */
+function buildSearchFilterBar(opts){
+  opts = opts || {};
+  const showUnitFilter = opts.showUnitFilter !== false;
+  const bar = el('div',{style:'display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:14px;'});
+  const searchInp = el('input',{type:'text', placeholder:'🔍 Cari nama pegawai…', value:state.searchQuery||'', style:'flex:1;min-width:180px;max-width:280px;'});
+  searchInp.addEventListener('input', e=>{ state.searchQuery = e.target.value; rerender(); });
+  bar.appendChild(searchInp);
+  if(showUnitFilter){
+    const unitSel = el('select',{style:'min-width:160px;'});
+    unitSel.appendChild(el('option',{value:''},['Semua Unit']));
+    state.units.forEach(u=>{
+      const o = el('option',{value:u.id},[u.nama]);
+      if(state.searchUnitId===u.id) o.selected = true;
+      unitSel.appendChild(o);
+    });
+    unitSel.addEventListener('change', e=>{ state.searchUnitId = e.target.value; rerender(); });
+    bar.appendChild(unitSel);
+  }
+  if(state.searchQuery || (showUnitFilter && state.searchUnitId)){
+    const clearBtn = el('button',{class:'btn btn-outline btn-sm'},['✕ Reset']);
+    clearBtn.addEventListener('click', ()=>{ state.searchQuery=''; state.searchUnitId=''; rerender(); });
+    bar.appendChild(clearBtn);
+  }
+  return bar;
+}
+/** Cek apakah seorang pegawai lolos filter pencarian+unit yang sedang aktif. */
+function matchesSearchFilter(p){
+  const q = (state.searchQuery||'').trim().toLowerCase();
+  if(q && !p.nama.toLowerCase().includes(q)) return false;
+  if(state.searchUnitId && p.unitId !== state.searchUnitId) return false;
+  return true;
+}
 function weightForUnit(unitId){
   const ov = state.perUnitWeight[unitId];
   if(ov && ov.enabled) return {sikap:ov.sikap, kinerja:ov.kinerja, mutu:ov.mutu};
@@ -1149,6 +1187,25 @@ async function deletePenilaian(periode, pegawaiId){
   delete state.penilaian[pnKey(periode, pegawaiId)];
 }
 
+/* ============ PENGANGKATAN PEGAWAI TETAP ============ */
+function getPengangkatan(pegawaiId){
+  if(!state.pengangkatan[pegawaiId]){
+    state.pengangkatan[pegawaiId] = { riwayat: [] };
+  }
+  return state.pengangkatan[pegawaiId];
+}
+async function savePengangkatan(pegawaiId){
+  const data = getPengangkatan(pegawaiId);
+  return queuedSave('pengangkatan:'+pegawaiId, ()=>Storage.set('pengangkatan:'+pegawaiId, JSON.stringify(data), true));
+}
+async function loadPengangkatanForPegawai(pegawaiId){
+  try{
+    const r = await Storage.get('pengangkatan:'+pegawaiId, true);
+    if(r && r.value) state.pengangkatan[pegawaiId] = JSON.parse(r.value);
+  }catch(e){}
+  return getPengangkatan(pegawaiId);
+}
+
 /* ============ SCORING LOGIC ============ */
 function tierScore(value, t){
   if(t.higherBetter){
@@ -1306,8 +1363,8 @@ async function render(){
   const navItems = {
     pegawai_self:[['absen','👆','Absen Mandiri']],
     unit:[['dashboard','◆','Dashboard'],['jadwal','📅','Jadwal Jaga'],['rekap_absensi','📥','Rekap Absensi'],['input','◆','Input Penilaian'],['input_ai','✨','Input Bulanan (AI)']],
-    hrd:[['dashboard','◆','Dashboard'],['validasi_hrd','◆','Validasi Sikap Kerja'],['validasi_diklat','◆','Validasi Kinerja & Mutu'],['rekap_absensi','📥','Rekap Absensi'],['pegawai','◆','Data Pegawai']],
-    admin:[['dashboard','◆','Dashboard'],['unit_master','◆','Data Unit'],['pegawai','◆','Data Pegawai'],['pegawai_ai','📊','Input Massal Pegawai'],['aspek_master','◆','Aspek Penilaian'],['jadwal','📅','Jadwal Jaga'],['rekap_absensi','📥','Rekap Absensi'],['input','◆','Input Penilaian'],['input_ai','✨','Input Bulanan (AI)'],['validasi_hrd','◆','Validasi Sikap Kerja'],['validasi_diklat','◆','Validasi Kinerja & Mutu'],['rekap','◆','Rekap & Tukin'],['pengaturan','◆','Pengaturan Bobot']],
+    hrd:[['dashboard','◆','Dashboard'],['validasi_hrd','◆','Validasi Sikap Kerja'],['validasi_diklat','◆','Validasi Kinerja & Mutu'],['rekap_absensi','📥','Rekap Absensi'],['pengangkatan','🎓','Pengangkatan Pegawai Tetap'],['pegawai','◆','Data Pegawai']],
+    admin:[['dashboard','◆','Dashboard'],['unit_master','◆','Data Unit'],['pegawai','◆','Data Pegawai'],['pegawai_ai','📊','Input Massal Pegawai'],['aspek_master','◆','Aspek Penilaian'],['jadwal','📅','Jadwal Jaga'],['rekap_absensi','📥','Rekap Absensi'],['input','◆','Input Penilaian'],['input_ai','✨','Input Bulanan (AI)'],['validasi_hrd','◆','Validasi Sikap Kerja'],['validasi_diklat','◆','Validasi Kinerja & Mutu'],['pengangkatan','🎓','Pengangkatan Pegawai Tetap'],['rekap','◆','Rekap & Tukin'],['pengaturan','◆','Pengaturan Bobot']],
   };
   const navRoleKey = state.role==='pegawai' ? 'pegawai_self' : state.role;
   const nav = el('div',{class:'nav'});
@@ -1331,6 +1388,7 @@ async function render(){
     input_ai:['Input Bulanan (AI)','Tempel catatan/laporan bulanan unit, AI bantu susun skor awal — Unit '+unitName(state.currentUnitId)],
     jadwal:['Jadwal Jaga','Atur shift kerja tiap pegawai per hari (shift bergilir) — Unit '+unitName(state.currentUnitId)],
     rekap_absensi:['Rekap Absensi','Ringkasan kehadiran dari Absen Mandiri — bisa diunduh ke Excel'],
+    pengangkatan:['Pengangkatan Pegawai Tetap','Penilaian kelayakan pegawai percobaan/kontrak untuk diangkat menjadi pegawai tetap'],
     pegawai_ai:['Input Massal Pegawai','Upload Excel untuk data besar (instan), atau tempel teks bebas dibantu AI'],
     aspek_master:['Aspek Penilaian','Sesuaikan daftar aspek penilaian dengan regulasi/akreditasi rumah sakit (KARS, dsb)'],
     absen:['Absen Mandiri','Verifikasi lokasi & sidik jari untuk absen masuk/pulang'],
@@ -1398,6 +1456,7 @@ async function renderTab(body){
   if(state.tab==='input_ai') return renderInputAI(body);
   if(state.tab==='jadwal') return renderJadwalJaga(body);
   if(state.tab==='rekap_absensi') return renderRekapAbsensi(body);
+  if(state.tab==='pengangkatan') return renderPengangkatan(body);
   if(state.tab==='pegawai_ai') return renderPegawaiAI(body);
   if(state.tab==='aspek_master') return renderAspekMaster(body);
   if(state.tab==='absen') return renderAbsenMandiri(body);
@@ -1839,13 +1898,17 @@ function renderPegawai(body){
   head.appendChild(el('h3',{style:'margin:0;'},['Master Data Pegawai']));
   head.appendChild(el('button',{class:'btn btn-primary', onclick:()=>{ state.modal={type:'add_pegawai'}; rerender(); }},['+ Tambah Pegawai']));
   panel.appendChild(head);
+  panel.appendChild(buildSearchFilterBar());
 
+  const pegawaiFiltered = state.pegawai.filter(matchesSearchFilter);
   if(state.pegawai.length===0){
     panel.appendChild(el('div',{class:'empty'},['Belum ada pegawai terdaftar.']));
+  } else if(pegawaiFiltered.length===0){
+    panel.appendChild(el('div',{class:'empty'},['Tidak ada pegawai yang cocok dengan pencarian/filter.']));
   } else {
     const table = el('table');
     table.appendChild(el('tr',null,[el('th',null,['Nama']),el('th',null,['Unit']),el('th',null,['Jabatan']),el('th',null,['Shift']),el('th',null,['Tukin Maks (Rp)']),el('th',null,[''])]));
-    state.pegawai.forEach(p=>{
+    pegawaiFiltered.forEach(p=>{
       const unitSel = el('select',{style:'padding:5px 7px;border:1px solid var(--line);border-radius:6px;font-size:12px;'+(!p.unitId?'border-color:var(--red);':'')});
       unitSel.appendChild(el('option',{value:''},['— Belum diatur —']));
       state.units.forEach(u=>{
@@ -2220,7 +2283,19 @@ function exportRekapAbsensiExcel(rows, periode, unitLabel){
 
 async function renderRekapAbsensi(body){
   const isUnitRole = state.role==='unit';
-  const staffPool = isUnitRole ? state.pegawai.filter(p=>p.unitId===state.currentUnitId) : state.pegawai;
+  let staffPool = isUnitRole ? state.pegawai.filter(p=>p.unitId===state.currentUnitId) : state.pegawai;
+  if(!isUnitRole && state.searchUnitId) staffPool = staffPool.filter(p=>p.unitId===state.searchUnitId);
+
+  if(!isUnitRole){
+    const unitFilterRow = el('div',{style:'display:flex;gap:8px;align-items:center;margin-bottom:14px;'});
+    unitFilterRow.appendChild(el('span',{style:'font-size:12px;color:var(--ink-soft);'},['Filter Unit:']));
+    const unitSel = el('select');
+    unitSel.appendChild(el('option',{value:''},['Semua Unit']));
+    state.units.forEach(u=>{ const o=el('option',{value:u.id},[u.nama]); if(state.searchUnitId===u.id) o.selected=true; unitSel.appendChild(o); });
+    unitSel.addEventListener('change', e=>{ state.searchUnitId = e.target.value; rerender(); });
+    unitFilterRow.appendChild(unitSel);
+    body.appendChild(unitFilterRow);
+  }
 
   /* Panel Jam Kedatangan — lihat jam masuk/pulang per pegawai untuk SATU tanggal (default hari ini) */
   const panelJam = el('div',{class:'panel',style:'border-color:var(--teal);'});
@@ -2235,11 +2310,43 @@ async function renderRekapAbsensi(body){
   jamDateRow.appendChild(jamBtn);
   jamDateRow.appendChild(jamDlBtn);
   panelJam.appendChild(jamDateRow);
+  // Pencarian nama LOKAL (tidak memicu ambil ulang data dari server tiap huruf diketik — cukup menyaring hasil yang sudah dimuat)
+  const jamSearchInp = el('input',{type:'text', placeholder:'🔍 Cari nama pegawai (dari hasil yang sudah dimuat)…', style:'width:100%;margin-bottom:10px;'});
+  panelJam.appendChild(jamSearchInp);
   const jamResult = el('div',{id:'jam-kedatangan-result'});
   panelJam.appendChild(jamResult);
   body.appendChild(panelJam);
 
   let lastJamRows = null;
+  function renderJamTable(rows){
+    jamResult.innerHTML = '';
+    if(rows.length===0){
+      jamResult.appendChild(el('div',{class:'empty'},['Tidak ada yang cocok dengan pencarian.']));
+      return;
+    }
+    const table = el('table');
+    table.appendChild(el('tr',null,[el('th',null,['Nama']), el('th',null,['Unit']), el('th',null,['Shift']), el('th',null,['Jam Masuk']), el('th',null,['Jam Pulang']), el('th',null,['Status'])]));
+    rows.forEach(r=>{
+      let statusBadgeEl;
+      if(r.statusMasuk==='libur') statusBadgeEl = el('span',{class:'chip'},['🛌 Libur']);
+      else if(r.statusMasuk==='ontime') statusBadgeEl = el('span',{class:'badge final'},['Tepat Waktu']);
+      else if(r.statusMasuk==='telat') statusBadgeEl = el('span',{class:'badge revisi'},['Terlambat']);
+      else if(r.statusMasuk==='alpha') statusBadgeEl = el('span',{class:'badge draft'},['Belum Absen']);
+      else statusBadgeEl = el('span',{class:'badge draft'},['-']);
+      table.appendChild(el('tr',null,[
+        el('td',null,[r.nama]), el('td',null,[r.unit]), el('td',null,[r.shiftNama]),
+        el('td',{style:'font-weight:700;'},[r.jamMasuk||'—']),
+        el('td',{style:'font-weight:700;'},[r.jamPulang||'—']),
+        el('td',null,[statusBadgeEl]),
+      ]));
+    });
+    jamResult.appendChild(table);
+  }
+  jamSearchInp.addEventListener('input', ()=>{
+    if(!lastJamRows) return;
+    const q = jamSearchInp.value.trim().toLowerCase();
+    renderJamTable(q ? lastJamRows.filter(r=>r.nama.toLowerCase().includes(q)) : lastJamRows);
+  });
   async function loadJamKedatangan(){
     jamResult.innerHTML = '';
     jamDlBtn.style.display = 'none';
@@ -2264,29 +2371,15 @@ async function renderRekapAbsensi(body){
     });
     lastJamRows = rows;
     jamDlBtn.style.display = '';
-    jamResult.innerHTML = '';
-    const table = el('table');
-    table.appendChild(el('tr',null,[el('th',null,['Nama']), el('th',null,['Unit']), el('th',null,['Shift']), el('th',null,['Jam Masuk']), el('th',null,['Jam Pulang']), el('th',null,['Status'])]));
-    rows.forEach(r=>{
-      let statusBadgeEl;
-      if(r.statusMasuk==='libur') statusBadgeEl = el('span',{class:'chip'},['🛌 Libur']);
-      else if(r.statusMasuk==='ontime') statusBadgeEl = el('span',{class:'badge final'},['Tepat Waktu']);
-      else if(r.statusMasuk==='telat') statusBadgeEl = el('span',{class:'badge revisi'},['Terlambat']);
-      else if(r.statusMasuk==='alpha') statusBadgeEl = el('span',{class:'badge draft'},['Belum Absen']);
-      else statusBadgeEl = el('span',{class:'badge draft'},['-']);
-      table.appendChild(el('tr',null,[
-        el('td',null,[r.nama]), el('td',null,[r.unit]), el('td',null,[r.shiftNama]),
-        el('td',{style:'font-weight:700;'},[r.jamMasuk||'—']),
-        el('td',{style:'font-weight:700;'},[r.jamPulang||'—']),
-        el('td',null,[statusBadgeEl]),
-      ]));
-    });
-    jamResult.appendChild(table);
+    jamSearchInp.value = '';
+    renderJamTable(rows);
   }
   jamBtn.addEventListener('click', loadJamKedatangan);
   jamDlBtn.addEventListener('click', ()=>{
     if(!lastJamRows) return;
-    exportJamKedatanganExcel(lastJamRows, jamDate.value, isUnitRole?unitName(state.currentUnitId):'Semua Unit');
+    const q = jamSearchInp.value.trim().toLowerCase();
+    const rowsToExport = q ? lastJamRows.filter(r=>r.nama.toLowerCase().includes(q)) : lastJamRows;
+    exportJamKedatanganExcel(rowsToExport, jamDate.value, isUnitRole?unitName(state.currentUnitId):'Semua Unit');
   });
   await loadJamKedatangan();
 
@@ -2313,11 +2406,40 @@ async function renderRekapAbsensi(body){
   panel.appendChild(rangeRow);
   panel.appendChild(el('div',{class:'small-note',style:'margin-top:-8px;margin-bottom:12px;'},['"Unduh Detail Harian" berisi jam masuk & pulang tiap pegawai untuk SETIAP hari dalam rentang (cocok untuk arsip/lampiran bulanan) — bisa memakan waktu lebih lama untuk rentang panjang atau pegawai banyak.']));
 
+  // Pencarian nama LOKAL (menyaring hasil yang sudah dimuat, tidak memicu hitung ulang ke server)
+  const rekapSearchInp = el('input',{type:'text', placeholder:'🔍 Cari nama pegawai (dari hasil yang sudah dimuat)…', style:'width:100%;margin-bottom:10px;'});
+  panel.appendChild(rekapSearchInp);
+
   const resultBox = el('div',{id:'rekap-absensi-result'});
   panel.appendChild(resultBox);
   body.appendChild(panel);
 
   let lastRows = null;
+  function renderRekapTable(rows){
+    resultBox.innerHTML = '';
+    if(rows.length===0){
+      resultBox.appendChild(el('div',{class:'empty'},['Tidak ada yang cocok dengan pencarian.']));
+      return;
+    }
+    const table = el('table');
+    table.appendChild(el('tr',null,[
+      el('th',null,['Nama']),el('th',null,['Unit']),el('th',null,['Shift']),el('th',null,['% Hadir']),
+      el('th',null,['Terlambat']),el('th',null,['Alpha']),el('th',null,['Libur']),el('th',null,['Total Hari'])
+    ]));
+    rows.forEach(r=>{
+      table.appendChild(el('tr',null,[
+        el('td',null,[r.nama]), el('td',null,[r.unit]), el('td',null,[r.shiftNama]),
+        el('td',null,[r.hadir_persen+'%']), el('td',null,[String(r.terlambat)]), el('td',null,[String(r.alpha)]),
+        el('td',null,[String(r.liburHari)]), el('td',null,[String(r.totalHari)]),
+      ]));
+    });
+    resultBox.appendChild(table);
+  }
+  rekapSearchInp.addEventListener('input', ()=>{
+    if(!lastRows) return;
+    const q = rekapSearchInp.value.trim().toLowerCase();
+    renderRekapTable(q ? lastRows.filter(r=>r.nama.toLowerCase().includes(q)) : lastRows);
+  });
 
   async function loadAndRender(){
     resultBox.innerHTML = '';
@@ -2342,28 +2464,18 @@ async function renderRekapAbsensi(body){
       return { nama:p.nama, unit:unitName(p.unitId), shiftNama:sum.shiftNama, hadir_persen:sum.hadir_persen, terlambat:sum.terlambat, alpha:sum.alpha, liburHari:sum.liburHari, totalHari:sum.totalHari };
     });
     lastRows = rows;
-    resultBox.innerHTML = '';
-    const table = el('table');
-    table.appendChild(el('tr',null,[
-      el('th',null,['Nama']),el('th',null,['Unit']),el('th',null,['Shift']),el('th',null,['% Hadir']),
-      el('th',null,['Terlambat']),el('th',null,['Alpha']),el('th',null,['Libur']),el('th',null,['Total Hari'])
-    ]));
-    rows.forEach(r=>{
-      table.appendChild(el('tr',null,[
-        el('td',null,[r.nama]), el('td',null,[r.unit]), el('td',null,[r.shiftNama]),
-        el('td',null,[r.hadir_persen+'%']), el('td',null,[String(r.terlambat)]), el('td',null,[String(r.alpha)]),
-        el('td',null,[String(r.liburHari)]), el('td',null,[String(r.totalHari)]),
-      ]));
-    });
-    resultBox.appendChild(table);
+    rekapSearchInp.value = '';
+    renderRekapTable(rows);
     dlBtn.style.display = '';
   }
 
   loadBtn.addEventListener('click', loadAndRender);
   dlBtn.addEventListener('click', ()=>{
     if(!lastRows) return;
+    const q = rekapSearchInp.value.trim().toLowerCase();
+    const rowsToExport = q ? lastRows.filter(r=>r.nama.toLowerCase().includes(q)) : lastRows;
     const periodeLabel = dStart.value+' s.d. '+dEnd.value;
-    exportRekapAbsensiExcel(lastRows, periodeLabel, isUnitRole?unitName(state.currentUnitId):'Semua Unit');
+    exportRekapAbsensiExcel(rowsToExport, periodeLabel, isUnitRole?unitName(state.currentUnitId):'Semua Unit');
   });
   detailDlBtn.addEventListener('click', async ()=>{
     if(staffPool.length===0){ alert('Belum ada pegawai untuk direkap.'); return; }
@@ -2404,6 +2516,203 @@ async function renderRekapAbsensi(body){
   });
 
   await loadAndRender(); // langsung tampil begitu halaman dibuka, dengan rentang default (awal bulan s/d hari ini)
+}
+
+/* ============ PENGANGKATAN PEGAWAI TETAP ============ */
+const KEPUTUSAN_LABEL = { layak:'✅ Layak Diangkat', perpanjang:'⏳ Perpanjang Masa Percobaan', tidak_lanjut:'❌ Tidak Dilanjutkan' };
+const KEPUTUSAN_BADGE_CLASS = { layak:'badge final', perpanjang:'badge revisi', tidak_lanjut:'badge draft' };
+
+async function renderPengangkatan(body){
+  const panel = el('div',{class:'panel'});
+  panel.appendChild(el('h3',null,['🎓 Penilaian Kelayakan Pengangkatan Pegawai Tetap']));
+  panel.appendChild(el('div',{class:'small-note',style:'margin-bottom:12px;'},['Dinilai langsung oleh HRD/Manajemen — menggabungkan data Sikap Kerja (otomatis dari absensi), Kinerja & Mutu Pelayanan, serta kriteria tambahan khusus pengangkatan.']));
+
+  if(state.pegawai.length===0){
+    panel.appendChild(el('div',{class:'empty'},['Belum ada data pegawai.']));
+    body.appendChild(panel);
+    return;
+  }
+  panel.appendChild(buildSearchFilterBar());
+
+  const table = el('table');
+  table.appendChild(el('tr',null,[
+    el('th',null,['Nama']), el('th',null,['Unit']), el('th',null,['Status Kepegawaian']),
+    el('th',null,['Tgl Mulai Kerja']), el('th',null,['Keputusan Terakhir']), el('th',null,['Aksi']),
+  ]));
+  // urutkan: yang masih Percobaan/Kontrak duluan (paling relevan untuk dinilai), baru yang sudah Tetap
+  const sorted = [...state.pegawai].filter(matchesSearchFilter).sort((a,b)=>{
+    const rank = s => s==='Tetap' ? 1 : 0;
+    return rank(a.statusKepegawaian) - rank(b.statusKepegawaian);
+  });
+  if(sorted.length===0){
+    table.appendChild(el('tr',null,[el('td',{colspan:'6',class:'empty'},['Tidak ada pegawai yang cocok dengan pencarian/filter.'])]));
+  }
+  sorted.forEach(p=>{
+    const pgk = state.pengangkatan[p.id];
+    const last = pgk && pgk.riwayat && pgk.riwayat.length>0 ? pgk.riwayat[pgk.riwayat.length-1] : null;
+    const statusBadge = el('span',{class: p.statusKepegawaian==='Tetap' ? 'badge final' : 'chip'},[p.statusKepegawaian||'Percobaan']);
+    table.appendChild(el('tr',null,[
+      el('td',null,[p.nama]), el('td',null,[unitName(p.unitId)]), el('td',null,[statusBadge]),
+      el('td',null,[p.tglMulaiKerja||'—']),
+      el('td',null,[last ? el('span',{class:KEPUTUSAN_BADGE_CLASS[last.keputusan]},[KEPUTUSAN_LABEL[last.keputusan]]) : el('span',{class:'small-note'},['Belum dinilai'])]),
+      el('td',null,[el('button',{class:'btn btn-outline btn-sm', onclick:()=>{ state.modal={type:'pengangkatan', pegawaiId:p.id}; rerender(); }},['🎓 Nilai'])]),
+    ]));
+  });
+  panel.appendChild(table);
+  body.appendChild(panel);
+}
+
+function buildKriteriaTambahanRow(item, onChange, onDelete){
+  const row = el('div',{class:'score-row',style:'flex-wrap:wrap;'});
+  const nameInp = el('input',{value:item.nama, placeholder:'Nama kriteria (mis. Tes Kompetensi)', style:'flex:1;min-width:160px;'});
+  nameInp.addEventListener('input', e=>{ item.nama = e.target.value; onChange(); });
+  const left = el('div',{style:'flex:1;min-width:160px;'},[nameInp]);
+  row.appendChild(left);
+  const pick = el('div',{class:'score-pick'});
+  [1,2,3,4].forEach(v=>{
+    const btn = el('button',null,[String(v)]);
+    if(item.skor===v) btn.className='sel';
+    btn.addEventListener('click',()=>{
+      item.skor = v; onChange();
+      Array.from(pick.children).forEach(c=>c.className='');
+      btn.className='sel';
+    });
+    pick.appendChild(btn);
+  });
+  row.appendChild(pick);
+  const delBtn = el('button',{class:'btn btn-outline btn-sm',style:'color:var(--red);border-color:var(--red);'},['✕']);
+  delBtn.addEventListener('click', onDelete);
+  row.appendChild(delBtn);
+  return row;
+}
+
+async function buildPengangkatanModal(modal, pegawaiId){
+  const p = state.pegawai.find(x=>x.id===pegawaiId);
+  if(!p){
+    modal.appendChild(el('div',{class:'warn-note'},['Pegawai tidak ditemukan.']));
+    modal.appendChild(el('div',{style:'margin-top:14px;display:flex;justify-content:flex-end;'},[el('button',{class:'btn btn-outline', onclick:()=>{state.modal=null; rerender();}},['Tutup'])]));
+    return;
+  }
+  await loadPengangkatanForPegawai(p.id);
+  const pgk = getPengangkatan(p.id);
+
+  modal.appendChild(el('div',{class:'modal-head'},[
+    el('div',null,[el('h3',null,[p.nama]), el('div',{class:'sub',style:'color:var(--ink-soft);font-size:11.5px;margin-top:3px;'},[unitName(p.unitId)+' · '+p.jabatan+' · Status: '+(p.statusKepegawaian||'Percobaan')])]),
+    el('button',{class:'x-btn', onclick:()=>{state.modal=null; rerender();}},['✕'])
+  ]));
+
+  if(pgk.riwayat.length>0){
+    const histBox = el('div',{class:'small-note',style:'margin-bottom:14px;'});
+    histBox.appendChild(el('div',{style:'font-weight:700;margin-bottom:4px;'},['Riwayat penilaian sebelumnya:']));
+    pgk.riwayat.forEach(r=>{
+      histBox.appendChild(el('div',null,['• '+r.tanggalPenilaian+' — '+KEPUTUSAN_LABEL[r.keputusan]+(r.catatanHRD?' ("'+r.catatanHRD+'")':'')]));
+    });
+    modal.appendChild(histBox);
+  }
+
+  // ---- Data dasar ----
+  const grid = el('div',{class:'form-grid'});
+  const tglMulai = el('input',{type:'date', value:p.tglMulaiKerja||''});
+  const masaPercobaan = el('input',{type:'number', value:3, min:1});
+  grid.appendChild(el('div',{class:'field'},[el('label',null,['Tanggal Mulai Kerja']),tglMulai]));
+  grid.appendChild(el('div',{class:'field'},[el('label',null,['Masa Percobaan (bulan)']),masaPercobaan]));
+  modal.appendChild(grid);
+
+  // ---- Sikap Kerja (manual input rangkuman absensi selama masa percobaan) ----
+  modal.appendChild(el('h4',{style:'margin-top:18px;'},['1. Sikap Kerja — Rangkuman Absensi Selama Masa Percobaan']));
+  const aGrid = el('div',{class:'form-grid'});
+  const fHadir = el('input',{type:'number', value:100});
+  const fTerlambat = el('input',{type:'number', value:0});
+  const fAlpha = el('input',{type:'number', value:0});
+  const fSp = el('input',{type:'number', value:0});
+  aGrid.appendChild(el('div',{class:'field'},[el('label',null,['% Kehadiran']),fHadir]));
+  aGrid.appendChild(el('div',{class:'field'},[el('label',null,['Jumlah Terlambat (kali)']),fTerlambat]));
+  aGrid.appendChild(el('div',{class:'field'},[el('label',null,['Alpha / Tanpa Keterangan (hari)']),fAlpha]));
+  aGrid.appendChild(el('div',{class:'field'},[el('label',null,['Surat Peringatan Aktif']),fSp]));
+  modal.appendChild(aGrid);
+  const sikapScoreNote = el('div',{class:'small-note'},['Skor Sikap Kerja otomatis: —']);
+  modal.appendChild(sikapScoreNote);
+  function refreshSikapScore(){
+    const ab = {hadir_persen:Number(fHadir.value)||0, terlambat:Number(fTerlambat.value)||0, alpha:Number(fAlpha.value)||0, sp_aktif:Number(fSp.value)||0};
+    const sc = computeSikapFromAbsensi(ab);
+    const avg = avgScore(sc, state.aspekConfig.sikap.filter(a=>a.type==='otomatis'||['kehadiran','ketepatan_waktu','kepatuhan_izin','kedisiplinan'].includes(a.key)), null);
+    sikapScoreNote.textContent = 'Skor Sikap Kerja otomatis (rata-rata): '+(avg!==null?avg.toFixed(2):'—')+' / 4';
+  }
+  [fHadir,fTerlambat,fAlpha,fSp].forEach(inp=>inp.addEventListener('input', refreshSikapScore));
+  refreshSikapScore();
+
+  // ---- Kinerja ----
+  modal.appendChild(el('h4',{style:'margin-top:18px;'},['2. Kinerja Pelayanan']));
+  const kinScores = {};
+  state.aspekConfig.kinerja.forEach(a=>{
+    modal.appendChild(buildScoreRow(a, kinScores[a.key], true, v=>{ kinScores[a.key]=v; }));
+  });
+
+  // ---- Mutu ----
+  modal.appendChild(el('h4',{style:'margin-top:18px;'},['3. Mutu Pelayanan']));
+  const mutuScores = {};
+  state.aspekConfig.mutu.forEach(a=>{
+    modal.appendChild(buildScoreRow(a, mutuScores[a.key], true, v=>{ mutuScores[a.key]=v; }));
+  });
+
+  // ---- Kriteria Tambahan Khusus Pengangkatan ----
+  modal.appendChild(el('h4',{style:'margin-top:18px;'},['4. Kriteria Tambahan Khusus Pengangkatan']));
+  modal.appendChild(el('div',{class:'small-note',style:'margin-bottom:8px;'},['Mis. Tes Kompetensi, Wawancara, Penilaian Atasan Langsung, dsb. — tambahkan sesuai kebutuhan.']));
+  const kriteriaTambahan = [];
+  const kriteriaBox = el('div');
+  modal.appendChild(kriteriaBox);
+  function renderKriteriaBox(){
+    kriteriaBox.innerHTML = '';
+    kriteriaTambahan.forEach((item, idx)=>{
+      kriteriaBox.appendChild(buildKriteriaTambahanRow(item, ()=>{}, ()=>{ kriteriaTambahan.splice(idx,1); renderKriteriaBox(); }));
+    });
+  }
+  renderKriteriaBox();
+  const addKriteriaBtn = el('button',{class:'btn btn-outline btn-sm',style:'margin-top:6px;'},['+ Tambah Kriteria']);
+  addKriteriaBtn.addEventListener('click', ()=>{ kriteriaTambahan.push({nama:'', skor:null}); renderKriteriaBox(); });
+  modal.appendChild(addKriteriaBtn);
+
+  // ---- Catatan ----
+  modal.appendChild(el('h4',{style:'margin-top:18px;'},['Catatan HRD']));
+  const catatan = el('textarea',{rows:3, placeholder:'Catatan tambahan (opsional)'});
+  modal.appendChild(catatan);
+
+  // ---- Keputusan ----
+  modal.appendChild(el('h4',{style:'margin-top:18px;'},['Keputusan Akhir']));
+  const decisionRow = el('div',{style:'display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;'});
+
+  function finalize(keputusan){
+    const kOk = state.aspekConfig.kinerja.every(a=>typeof kinScores[a.key]==='number');
+    const mOk = state.aspekConfig.mutu.every(a=>typeof mutuScores[a.key]==='number');
+    if(!kOk || !mOk){ alert('Lengkapi semua penilaian Kinerja & Mutu terlebih dahulu.'); return; }
+    if(!confirm('Simpan keputusan: '+KEPUTUSAN_LABEL[keputusan]+' untuk '+p.nama+'?')) return;
+    const record = {
+      id: generateId('pgk'),
+      tanggalPenilaian: todayISO(),
+      tglMulaiKerja: tglMulai.value||'',
+      masaPercobaanBulan: Number(masaPercobaan.value)||0,
+      absensi: {hadir_persen:Number(fHadir.value)||0, terlambat:Number(fTerlambat.value)||0, alpha:Number(fAlpha.value)||0, sp_aktif:Number(fSp.value)||0},
+      kinerja_score: kinScores, mutu_score: mutuScores,
+      kriteriaTambahan: kriteriaTambahan.filter(k=>k.nama.trim()),
+      catatanHRD: catatan.value.trim(),
+      keputusan,
+    };
+    pgk.riwayat.push(record);
+    p.tglMulaiKerja = tglMulai.value || p.tglMulaiKerja;
+    if(keputusan==='layak'){
+      p.statusKepegawaian = 'Tetap';
+      bgSave(savePegawaiSingle(p.id));
+    }
+    bgSave(savePengangkatan(p.id));
+    state.modal = null;
+    rerender();
+    alert('✓ Keputusan tersimpan: '+KEPUTUSAN_LABEL[keputusan]+(keputusan==='layak'?' — status kepegawaian otomatis diubah menjadi Tetap.':''));
+  }
+
+  decisionRow.appendChild(el('button',{class:'btn',style:'background:var(--green);color:#fff;flex:1;', onclick:()=>finalize('layak')},['✅ Layak Diangkat']));
+  decisionRow.appendChild(el('button',{class:'btn btn-gold',style:'flex:1;', onclick:()=>finalize('perpanjang')},['⏳ Perpanjang Masa Percobaan']));
+  decisionRow.appendChild(el('button',{class:'btn',style:'background:var(--red);color:#fff;flex:1;', onclick:()=>finalize('tidak_lanjut')},['❌ Tidak Dilanjutkan']));
+  modal.appendChild(decisionRow);
 }
 
 async function renderJadwalJaga(body){
@@ -2511,19 +2820,24 @@ function renderInput(body){
 
 /* ============ VALIDASI HRD ============ */
 function renderValidasiHRD(body){
-  const antrian = state.pegawai.filter(p=>{
+  const antrianAll = state.pegawai.filter(p=>{
     const pn = getPenilaian(state.periode,p.id);
     return pn.status==='DIAJUKAN';
   });
-  const sudah = state.pegawai.filter(p=>{
+  const sudahAll = state.pegawai.filter(p=>{
     const pn = getPenilaian(state.periode,p.id);
     return ['VALIDASI_HRD','VALIDASI_DIKLAT','FINAL','REVISI_DIKLAT'].includes(pn.status);
   });
+  const antrian = antrianAll.filter(matchesSearchFilter);
+  const sudah = sudahAll.filter(matchesSearchFilter);
 
   const panel = el('div',{class:'panel'});
-  panel.appendChild(el('h3',null,['Menunggu Validasi HRD ',el('span',{class:'n'},['('+antrian.length+')'])]));
-  if(antrian.length===0){
+  panel.appendChild(el('h3',null,['Menunggu Validasi HRD ',el('span',{class:'n'},['('+antrianAll.length+')'])]));
+  panel.appendChild(buildSearchFilterBar());
+  if(antrianAll.length===0){
     panel.appendChild(el('div',{class:'empty'},['Tidak ada pengajuan yang menunggu validasi.']));
+  } else if(antrian.length===0){
+    panel.appendChild(el('div',{class:'empty'},['Tidak ada yang cocok dengan pencarian/filter (dari '+antrianAll.length+' pengajuan menunggu).']));
   } else {
     const table = el('table');
     table.appendChild(el('tr',null,[el('th',null,['Nama']),el('th',null,['Unit']),el('th',null,['Skor Sikap Kerja (Auto)']),el('th',null,[''])]));
@@ -2558,13 +2872,18 @@ function renderValidasiHRD(body){
 
 /* ============ VALIDASI DIKLAT ============ */
 function renderValidasiDiklat(body){
-  const antrian = state.pegawai.filter(p=>getPenilaian(state.periode,p.id).status==='VALIDASI_HRD');
-  const sudah = state.pegawai.filter(p=>['FINAL'].includes(getPenilaian(state.periode,p.id).status));
+  const antrianAll = state.pegawai.filter(p=>getPenilaian(state.periode,p.id).status==='VALIDASI_HRD');
+  const sudahAll = state.pegawai.filter(p=>['FINAL'].includes(getPenilaian(state.periode,p.id).status));
+  const antrian = antrianAll.filter(matchesSearchFilter);
+  const sudah = sudahAll.filter(matchesSearchFilter);
 
   const panel = el('div',{class:'panel'});
-  panel.appendChild(el('h3',null,['Menunggu Validasi Diklat ',el('span',{class:'n'},['('+antrian.length+')'])]));
-  if(antrian.length===0){
+  panel.appendChild(el('h3',null,['Menunggu Validasi Diklat ',el('span',{class:'n'},['('+antrianAll.length+')'])]));
+  panel.appendChild(buildSearchFilterBar());
+  if(antrianAll.length===0){
     panel.appendChild(el('div',{class:'empty'},['Tidak ada pengajuan yang menunggu validasi.']));
+  } else if(antrian.length===0){
+    panel.appendChild(el('div',{class:'empty'},['Tidak ada yang cocok dengan pencarian/filter (dari '+antrianAll.length+' pengajuan menunggu).']));
   } else {
     const table = el('table');
     table.appendChild(el('tr',null,[el('th',null,['Nama']),el('th',null,['Unit']),el('th',null,['Kinerja']),el('th',null,['Mutu']),el('th',null,[''])]));
@@ -2713,17 +3032,22 @@ function renderRekap(body){
   const headRow = el('div',{class:'no-print',style:'display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:14px;'});
   headRow.appendChild(el('h3',{style:'margin:0;'},['Rekap Penilaian & Tukin — Periode '+state.periode]));
   const btnRow = el('div',{style:'display:flex;gap:8px;'});
-  btnRow.appendChild(el('button',{class:'btn btn-outline btn-sm', onclick:()=>{ exportRekapExcel(finals, state.periode); }},['💾 Unduh Excel']));
+  btnRow.appendChild(el('button',{class:'btn btn-outline btn-sm', onclick:()=>{ exportRekapExcel(finalsFiltered, state.periode); }},['💾 Unduh Excel']));
   btnRow.appendChild(el('button',{class:'btn btn-gold btn-sm', onclick:()=>{ window.print(); }},['🖨️ Cetak']));
   headRow.appendChild(btnRow);
   panel.appendChild(headRow);
+  panel.appendChild(el('div',{class:'no-print'},[buildSearchFilterBar()]));
 
+  const finalsFiltered = finals.filter(x=>matchesSearchFilter(x.p));
   const table = el('table');
   table.appendChild(el('tr',null,[
     el('th',null,['Nama']),el('th',null,['Unit']),el('th',null,['Sikap']),el('th',null,['Kinerja']),el('th',null,['Mutu']),
     el('th',null,['Skor Akhir']),el('th',null,['Grade']),el('th',null,['% Tukin']),el('th',null,['Nominal Tukin']),el('th',null,['Status'])
   ]));
-  finals.forEach(({p,pn,f})=>{
+  if(finalsFiltered.length===0){
+    table.appendChild(el('tr',null,[el('td',{colspan:'10',class:'empty'},['Tidak ada pegawai yang cocok dengan pencarian/filter.'])]));
+  }
+  finalsFiltered.forEach(({p,pn,f})=>{
     const nominal = pn.status==='FINAL' ? Math.round(Number(p.tukin_maks||0) * f.tier.persen/100) : null;
     table.appendChild(el('tr',null,[
       el('td',null,[p.nama]), el('td',null,[unitName(p.unitId)]),
@@ -3187,6 +3511,7 @@ function renderModal(){
   if(state.modal.type==='input_penilaian') buildInputPenilaianModal(modal);
   if(state.modal.type==='validasi_hrd') buildValidasiHRDModal(modal);
   if(state.modal.type==='validasi_diklat') buildValidasiDiklatModal(modal);
+  if(state.modal.type==='pengangkatan') buildPengangkatanModal(modal, state.modal.pegawaiId);
 
   document.getElementById('root').appendChild(bg);
 }
@@ -3208,11 +3533,16 @@ function buildEditPegawaiModal(modal, pegawaiId){
   const shiftSel = el('select');
   shiftSel.appendChild(el('option',{value:''},['(Belum diatur — pakai default)']));
   state.shiftDefs.forEach(s=>{ const o=el('option',{value:s.key},[s.nama+' ('+s.jamMulai+'–'+s.jamSelesai+')']); if(p.shiftKey===s.key) o.selected=true; shiftSel.appendChild(o); });
+  const statusSel = el('select');
+  ['Percobaan','Kontrak','Tetap'].forEach(s=>{ const o=el('option',{value:s},[s]); if((p.statusKepegawaian||'Percobaan')===s) o.selected=true; statusSel.appendChild(o); });
+  const tglMulai = el('input',{type:'date', value:p.tglMulaiKerja||''});
   grid.appendChild(el('div',{class:'field'},[el('label',null,['Nama']),nama]));
   grid.appendChild(el('div',{class:'field'},[el('label',null,['Unit']),unitSel]));
   grid.appendChild(el('div',{class:'field'},[el('label',null,['Jabatan']),jabatan]));
   grid.appendChild(el('div',{class:'field'},[el('label',null,['Tukin Maksimal (Rp)']),tukin]));
   grid.appendChild(el('div',{class:'field'},[el('label',null,['Shift Kerja']),shiftSel]));
+  grid.appendChild(el('div',{class:'field'},[el('label',null,['Status Kepegawaian']),statusSel]));
+  grid.appendChild(el('div',{class:'field'},[el('label',null,['Tanggal Mulai Kerja']),tglMulai]));
   modal.appendChild(grid);
   if(state.units.length===0) modal.appendChild(el('div',{class:'warn-note',style:'margin-top:10px;'},['Belum ada unit terdaftar — tambahkan dulu di menu "Data Unit" supaya bisa dipilih di sini.']));
   modal.appendChild(el('div',{style:'margin-top:18px;display:flex;justify-content:flex-end;gap:8px;'},[
@@ -3224,6 +3554,8 @@ function buildEditPegawaiModal(modal, pegawaiId){
       p.jabatan = jabatan.value.trim()||'-';
       p.tukin_maks = tukin.value||0;
       p.shiftKey = shiftSel.value||'';
+      p.statusKepegawaian = statusSel.value;
+      p.tglMulaiKerja = tglMulai.value||'';
       state.modal=null;
       rerender();
       bgSave(savePegawaiSingle(p.id));
@@ -3247,18 +3579,23 @@ function buildAddPegawaiModal(modal){
   const shiftSel = el('select');
   shiftSel.appendChild(el('option',{value:''},['(Belum diatur — pakai default)']));
   state.shiftDefs.forEach(s=>shiftSel.appendChild(el('option',{value:s.key},[s.nama+' ('+s.jamMulai+'–'+s.jamSelesai+')'])));
+  const statusSel = el('select');
+  ['Percobaan','Kontrak','Tetap'].forEach(s=>statusSel.appendChild(el('option',{value:s},[s])));
+  const tglMulai = el('input',{type:'date'});
   grid.appendChild(el('div',{class:'field'},[el('label',null,['Nama']),nama]));
   grid.appendChild(el('div',{class:'field'},[el('label',null,['Unit']),unitSel]));
   grid.appendChild(el('div',{class:'field'},[el('label',null,['Jabatan']),jabatan]));
   grid.appendChild(el('div',{class:'field'},[el('label',null,['Tukin Maksimal (Rp)']),tukin]));
   grid.appendChild(el('div',{class:'field'},[el('label',null,['Shift Kerja']),shiftSel]));
+  grid.appendChild(el('div',{class:'field'},[el('label',null,['Status Kepegawaian']),statusSel]));
+  grid.appendChild(el('div',{class:'field'},[el('label',null,['Tanggal Mulai Kerja']),tglMulai]));
   modal.appendChild(grid);
   modal.appendChild(el('div',{style:'margin-top:18px;display:flex;justify-content:flex-end;gap:8px;'},[
     el('button',{class:'btn btn-outline', onclick:()=>{state.modal=null; rerender();}},['Batal']),
     el('button',{class:'btn btn-primary', onclick:()=>{
       if(!nama.value.trim()){ alert('Nama wajib diisi'); return; }
       const id = generateId('peg');
-      state.pegawai.push({id, nama:nama.value.trim(), unitId:unitSel.value, jabatan:jabatan.value.trim()||'-', tukin_maks:tukin.value||0, shiftKey:shiftSel.value||''});
+      state.pegawai.push({id, nama:nama.value.trim(), unitId:unitSel.value, jabatan:jabatan.value.trim()||'-', tukin_maks:tukin.value||0, shiftKey:shiftSel.value||'', statusKepegawaian:statusSel.value, tglMulaiKerja:tglMulai.value||''});
       state.modal=null;
       rerender();
       bgSave(savePegawaiSingle(id));
