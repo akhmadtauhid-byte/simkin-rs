@@ -516,7 +516,7 @@ function buildSearchFilterBar(opts){
   opts = opts || {};
   const showUnitFilter = opts.showUnitFilter !== false;
   const bar = el('div',{style:'display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:14px;'});
-  const searchInp = el('input',{type:'text', placeholder:'🔍 Cari nama pegawai…', value:state.searchQuery||'', style:'flex:1;min-width:180px;max-width:280px;'});
+  const searchInp = el('input',{type:'text', placeholder:'🔍 Cari nama pegawai…', value:state.searchQuery||'', style:'flex:1;min-width:180px;max-width:280px;', 'data-focus-key':'global-search'});
   searchInp.addEventListener('input', e=>{ state.searchQuery = e.target.value; rerender(); });
   bar.appendChild(searchInp);
   if(showUnitFilter){
@@ -1288,6 +1288,18 @@ async function rerender(){ await render(); }
 /* ============ MAIN RENDER ============ */
 async function render(){
   const root = document.getElementById('root');
+  // Simpan fokus & posisi kursor SEBELUM tampilan digambar ulang dari nol — tanpa ini, kotak pencarian
+  // (dan input lain) kehilangan fokus setiap render, memaksa pengguna klik ulang tiap kali mengetik satu huruf.
+  const _prevFocused = document.activeElement;
+  let _focusRestore = null;
+  if(_prevFocused && _prevFocused.hasAttribute && _prevFocused.hasAttribute('data-focus-key')){
+    _focusRestore = {
+      key: _prevFocused.getAttribute('data-focus-key'),
+      selStart: _prevFocused.selectionStart,
+      selEnd: _prevFocused.selectionEnd,
+    };
+  }
+
   root.className='';
   root.innerHTML='';
 
@@ -1446,6 +1458,17 @@ async function render(){
   }
 
   if(state.modal) renderModal();
+
+  // Kembalikan fokus & posisi kursor ke input yang sama (kalau ada) setelah tampilan selesai digambar ulang.
+  if(_focusRestore){
+    const newEl = root.querySelector('[data-focus-key="'+_focusRestore.key+'"]');
+    if(newEl){
+      newEl.focus();
+      if(typeof newEl.setSelectionRange==='function' && _focusRestore.selStart!=null){
+        try{ newEl.setSelectionRange(_focusRestore.selStart, _focusRestore.selEnd); }catch(e){}
+      }
+    }
+  }
 }
 
 async function renderTab(body){
