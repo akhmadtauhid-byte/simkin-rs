@@ -950,20 +950,13 @@ function getCurrentLocation(){
  * tapi GPS asli selalu sedikit bergeser antar-pembacaan — sedangkan banyak aplikasi fake GPS memberi
  * koordinat statis yang persis identik terus-menerus). Menambah sedikit waktu tunggu (~1 detik) demi ini. */
 async function getLocationWithSpoofCheck(){
-  const loc1 = await getCurrentLocation();
-  await new Promise(res=>setTimeout(res, 900));
-  const loc2 = await getCurrentLocation();
-  const flags = [];
-  if(loc1.lat===loc2.lat && loc1.lng===loc2.lng){
-    flags.push('Koordinat tidak bergeser sama sekali antar-pembacaan (±1 detik) — GPS asli biasanya sedikit berubah.');
-  }
-  if(loc2.akurasi!=null && loc2.akurasi < 3){
-    flags.push('Akurasi GPS tidak wajar tinggi ('+loc2.akurasi.toFixed(1)+' m).');
-  }
-  if(loc2.akurasi!=null && loc2.akurasi > 1000){
-    flags.push('Akurasi GPS sangat buruk ('+Math.round(loc2.akurasi)+' m) — sinyal lemah atau tidak wajar.');
-  }
-  return { lat:loc2.lat, lng:loc2.lng, akurasi:loc2.akurasi, suspicious: flags.length>0, flags };
+  // CATATAN: sebelumnya di sini ada pengecekan "dua pembacaan GPS berjarak 1 detik, koordinat identik = mencurigakan".
+  // Ternyata itu SALAH — banyak HP asli (terutama di dalam gedung) memang memakai lokasi ter-cache oleh sistem
+  // operasinya untuk jeda sesingkat itu, sehingga hampir SEMUA pegawai (bukan cuma yang curang) ikut tertandai.
+  // Karena tidak ada cara andal mendeteksi GPS palsu murni dari browser, pengecekan otomatis ini DIHENTIKAN
+  // dulu supaya tidak menuduh pegawai jujur secara keliru — cukup ambil satu pembacaan lokasi seperti biasa.
+  const loc = await getCurrentLocation();
+  return { lat:loc.lat, lng:loc.lng, akurasi:loc.akurasi, suspicious:false, flags:[] };
 }
 function distanceMeters(lat1,lng1,lat2,lng2){
   const R=6371000, toRad=d=>d*Math.PI/180;
