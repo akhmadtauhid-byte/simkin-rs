@@ -1430,6 +1430,35 @@ async function render(){
   state.periodeList.forEach(pr=>{ const o=el('option',{value:pr},[pr]); if(pr===state.periode) o.selected=true; pSel.appendChild(o); });
   pSel.appendChild(el('option',{value:'__new__'},['+ Tambah periode baru']));
   periodeBox.appendChild(pSel);
+  // Hapus periode — khusus Super Admin, PIN diminta ulang setiap kali (tidak mengandalkan sesi yang mungkin sudah lama terbuka).
+  if(state.role==='admin'){
+    const delPeriodeBtn = el('button',{class:'btn btn-outline btn-sm',style:'color:var(--red);border-color:var(--red);margin-left:6px;', title:'Hapus periode ini (khusus Super Admin)'},['🗑️']);
+    delPeriodeBtn.addEventListener('click', async ()=>{
+      const toDelete = state.periode;
+      if(state.periodeList.length<=1){ alert('Tidak bisa menghapus — minimal harus ada 1 periode tersisa.'); return; }
+      if(!state.superAdminPin){ alert('PIN Super Admin belum diatur — atur dulu di Pengaturan Bobot → Keamanan Admin sebelum bisa menghapus periode.'); return; }
+      const inputPin = prompt('Fitur ini khusus Super Admin.\nMasukkan PIN Super Admin untuk menghapus periode "'+toDelete+'":');
+      if(inputPin===null) return; // dibatalkan pengguna
+      if(inputPin !== state.superAdminPin){ alert('PIN Super Admin salah. Penghapusan dibatalkan.'); return; }
+      if(!confirm('⚠️ Hapus periode "'+toDelete+'" beserta SEMUA data penilaian pegawai di periode ini?\n\nTindakan ini PERMANEN dan tidak bisa dibatalkan.')) return;
+      try{
+        const list = await Storage.list('penilaian:'+toDelete+':', true);
+        if(list && list.keys && list.keys.length>0){
+          await mapLimit(list.keys, 10, async (k)=>{ await Storage.delete(k, true); });
+        }
+        Object.keys(state.penilaian).forEach(pk=>{ if(pk.indexOf(toDelete+'::')===0) delete state.penilaian[pk]; });
+        state.periodeList = state.periodeList.filter(pr=>pr!==toDelete);
+        await savePeriodeList();
+        state.periode = state.periodeList[state.periodeList.length-1];
+        await loadPenilaianForPeriode(state.periode);
+        rerender();
+        alert('✓ Periode "'+toDelete+'" beserta seluruh data penilaiannya berhasil dihapus.');
+      }catch(err){
+        alert('❌ Gagal menghapus periode dari server: '+(err&&err.message||err));
+      }
+    });
+    periodeBox.appendChild(delPeriodeBtn);
+  }
   topbar.appendChild(periodeBox);
   main.appendChild(topbar);
 
