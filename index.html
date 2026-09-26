@@ -949,6 +949,85 @@ function getCurrentLocation(){
 /** Ambil lokasi dengan dua sampel berjarak singkat untuk mendeteksi indikasi lokasi palsu (bukan 100% pasti,
  * tapi GPS asli selalu sedikit bergeser antar-pembacaan — sedangkan banyak aplikasi fake GPS memberi
  * koordinat statis yang persis identik terus-menerus). Menambah sedikit waktu tunggu (~1 detik) demi ini. */
+/** Buka kamera depan, tampilkan pratinjau langsung di layar, dan kembalikan foto (dataURL JPEG terkompresi)
+ * setelah pengguna menekan tombol ambil foto. Ini pengganti deteksi GPS yang tidak andal — hasilnya bisa
+ * langsung dilihat mata oleh HRD/Kepala Unit, bukan tebakan algoritma. Menolak (reject) kalau kamera
+ * tidak tersedia/izin ditolak/dibatalkan pengguna. */
+function captureSelfie(){
+  return new Promise((resolve, reject)=>{
+    if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+      reject(new Error('Perangkat/browser ini tidak mendukung akses kamera. Pastikan dibuka lewat alamat https:// yang aman.'));
+      return;
+    }
+    const overlay = el('div',{style:'position:fixed;inset:0;background:rgba(0,0,0,0.88);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px;'});
+    const card = el('div',{style:'background:#fff;border-radius:16px;padding:18px;max-width:380px;width:100%;text-align:center;'});
+    card.appendChild(el('div',{style:'font-weight:800;font-size:15px;margin-bottom:10px;'},['📸 Ambil Foto Selfie untuk Absen']));
+    const videoWrap = el('div',{style:'border-radius:12px;overflow:hidden;background:#000;aspect-ratio:3/4;display:flex;align-items:center;justify-content:center;'});
+    const video = el('video',{autoplay:true, playsinline:true, muted:true, style:'width:100%;height:100%;object-fit:cover;transform:scaleX(-1);'});
+    videoWrap.appendChild(video);
+    card.appendChild(videoWrap);
+    const statusMsg = el('div',{class:'small-note',style:'margin-top:8px;'},['Meminta izin kamera…']);
+    card.appendChild(statusMsg);
+    const btnRow = el('div',{style:'display:flex;gap:8px;margin-top:14px;'});
+    const captureBtn = el('button',{class:'btn btn-primary',style:'flex:1;', disabled:true},['📸 Ambil Foto']);
+    const cancelBtn = el('button',{class:'btn btn-outline',style:'flex:1;'},['Batal']);
+    btnRow.appendChild(captureBtn); btnRow.appendChild(cancelBtn);
+    card.appendChild(btnRow);
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+
+    let stream = null;
+    let settled = false;
+    function cleanup(){
+      if(stream){ stream.getTracks().forEach(t=>t.stop()); }
+      if(overlay.parentNode) overlay.parentNode.removeChild(overlay);
+    }
+    cancelBtn.addEventListener('click', ()=>{
+      if(settled) return; settled = true;
+      cleanup(); reject(new Error('Pengambilan foto dibatalkan.'));
+    });
+
+    navigator.mediaDevices.getUserMedia({video:{facingMode:'user', width:{ideal:480}, height:{ideal:640}}, audio:false})
+      .then(s=>{
+        if(settled){ s.getTracks().forEach(t=>t.stop()); return; } // pengguna sempat batal sebelum kamera siap
+        stream = s;
+        video.srcObject = s;
+        statusMsg.textContent = 'Posisikan wajah Anda di tengah, lalu tekan tombol Ambil Foto.';
+        captureBtn.disabled = false;
+      })
+      .catch(err=>{
+        if(settled) return;
+        statusMsg.textContent = 'Gagal mengakses kamera: '+err.message+'. Pastikan izin kamera diaktifkan di pengaturan browser.';
+      });
+
+    captureBtn.addEventListener('click', ()=>{
+      if(settled) return; settled = true;
+      const targetW = 240, targetH = 320;
+      const canvas = document.createElement('canvas');
+      canvas.width = targetW; canvas.height = targetH;
+      const ctx = canvas.getContext('2d');
+      const vw = video.videoWidth||targetW, vh = video.videoHeight||targetH;
+      const vRatio = vw/vh, tRatio = targetW/targetH;
+      let sx=0, sy=0, sw=vw, sh=vh;
+      if(vRatio > tRatio){ sw = vh*tRatio; sx = (vw-sw)/2; } else { sh = vw/tRatio; sy = (vh-sh)/2; }
+      ctx.translate(targetW,0); ctx.scale(-1,1); // cerminkan biar sesuai pratinjau yang dilihat pengguna
+      ctx.drawImage(video, sx, sy, sw, sh, 0, 0, targetW, targetH);
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.6);
+      cleanup();
+      resolve(dataUrl);
+    });
+  });
+}
+/** Tampilkan foto (dataURL) dalam layar penuh, dengan tombol tutup — dipakai HRD/Kepala Unit meninjau selfie absen. */
+function showPhotoLightbox(dataUrl, caption){
+  const overlay = el('div',{style:'position:fixed;inset:0;background:rgba(0,0,0,0.9);z-index:9999;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px;', onclick:(e)=>{ if(e.target===overlay) document.body.removeChild(overlay); }});
+  const img = el('img',{src:dataUrl, style:'max-width:90vw;max-height:75vh;border-radius:12px;'});
+  overlay.appendChild(img);
+  if(caption) overlay.appendChild(el('div',{style:'color:#fff;margin-top:12px;font-size:13px;text-align:center;'},[caption]));
+  overlay.appendChild(el('button',{class:'btn btn-outline',style:'margin-top:14px;background:#fff;', onclick:()=>document.body.removeChild(overlay)},['Tutup']));
+  document.body.appendChild(overlay);
+}
+
 async function getLocationWithSpoofCheck(){
   // CATATAN: sebelumnya di sini ada pengecekan "dua pembacaan GPS berjarak 1 detik, koordinat identik = mencurigakan".
   // Ternyata itu SALAH — banyak HP asli (terutama di dalam gedung) memang memakai lokasi ter-cache oleh sistem
@@ -992,7 +1071,7 @@ async function getActiveAbsenSession(pegawaiId){
   return {dateISO: today, log: todayLog};
 }
 
-async function doAbsen(pegawaiId, jenis){ // jenis: 'masuk' | 'pulang'
+async function doAbsen(pegawaiId, jenis, foto){ // jenis: 'masuk' | 'pulang'; foto: dataURL selfie (opsional, dari captureSelfie)
   const sessionPromise = getActiveAbsenSession(pegawaiId); // mulai diambil dari sekarang, berbarengan dengan proses GPS & verifikasi di bawah
   const loc = await getLocationWithSpoofCheck();
   if(state.geofence.lat!=null && state.geofence.lng!=null){
@@ -1023,8 +1102,7 @@ async function doAbsen(pegawaiId, jenis){ // jenis: 'masuk' | 'pulang'
   }
   const now = new Date();
   const jam = now.toTimeString().slice(0,5);
-  // catatan kecurigaan TIDAK ditampilkan ke pegawai sendiri — hanya untuk peninjauan HRD/Admin nanti, supaya tidak "membocorkan" ke pelaku.
-  log[jenis] = { jam, lat:loc.lat, lng:loc.lng, akurasi:loc.akurasi, suspicious:loc.suspicious, suspicionFlags:loc.flags };
+  log[jenis] = { jam, lat:loc.lat, lng:loc.lng, akurasi:loc.akurasi, suspicious:loc.suspicious, suspicionFlags:loc.flags, foto: foto||null };
   await saveAbsensiLog(pegawaiId, dateISO, log);
   return log;
 }
@@ -1676,7 +1754,8 @@ async function renderAbsenMandiri(body){
   const doPunch = async (jenis)=>{
     state.absensiBusy = true; state.absensiMsg=null; rerender();
     try{
-      await doAbsen(me.id, jenis);
+      const foto = await captureSelfie(); // wajib — foto inilah yang jadi bukti kehadiran, bukan tebakan GPS
+      await doAbsen(me.id, jenis, foto);
       state.absensiMsg = {ok:true, text:'✓ Absen '+(jenis==='masuk'?'Masuk':'Pulang')+' berhasil dicatat pukul '+new Date().toTimeString().slice(0,5)+'.'};
     }catch(e){
       state.absensiMsg = {ok:false, text: e.message||'Absen gagal.'};
@@ -1689,7 +1768,7 @@ async function renderAbsenMandiri(body){
   if(masukLocked || pulangLocked){
     panel.appendChild(el('div',{class:'small-note',style:'margin-top:10px;'},['Absen yang sudah tercatat hari ini terkunci dan tidak bisa ditimpa/diubah lagi — kalau ada kesalahan, hubungi Kepala Unit/Admin.']));
   } else {
-    panel.appendChild(el('div',{class:'small-note',style:'margin-top:10px;'},['Menekan tombol akan meminta izin lokasi & verifikasi sidik jari perangkat. Absen ditolak otomatis kalau berada di luar radius lokasi RS yang ditetapkan Admin.']));
+    panel.appendChild(el('div',{class:'small-note',style:'margin-top:10px;'},['Menekan tombol akan meminta foto selfie, izin lokasi, & verifikasi sidik jari perangkat. Absen ditolak otomatis kalau berada di luar radius lokasi RS yang ditetapkan Admin.']));
   }
 
   body.appendChild(panel);
@@ -2378,10 +2457,17 @@ async function renderRekapAbsensi(body){
       else if(r.statusMasuk==='telat') statusBadgeEl = el('span',{class:'badge revisi'},['Terlambat']);
       else if(r.statusMasuk==='alpha') statusBadgeEl = el('span',{class:'badge draft'},['Belum Absen']);
       else statusBadgeEl = el('span',{class:'badge draft'},['-']);
+      const jamMasukCell = el('td',{style:'font-weight:700;'},[r.jamMasuk||'—']);
+      if(r.fotoMasuk){
+        jamMasukCell.appendChild(el('button',{class:'btn btn-outline btn-sm', style:'margin-left:6px;padding:2px 7px;', title:'Lihat foto selfie absen masuk', onclick:()=>showPhotoLightbox(r.fotoMasuk, r.nama+' — Absen Masuk '+r.jamMasuk+' ('+r.tanggal+')')},['📷']));
+      }
+      const jamPulangCell = el('td',{style:'font-weight:700;'},[r.jamPulang||'—']);
+      if(r.fotoPulang){
+        jamPulangCell.appendChild(el('button',{class:'btn btn-outline btn-sm', style:'margin-left:6px;padding:2px 7px;', title:'Lihat foto selfie absen pulang', onclick:()=>showPhotoLightbox(r.fotoPulang, r.nama+' — Absen Pulang '+r.jamPulang+' ('+r.tanggal+')')},['📷']));
+      }
       table.appendChild(el('tr',null,[
         el('td',null,[r.nama]), el('td',null,[r.unit]), el('td',null,[r.shiftNama]),
-        el('td',{style:'font-weight:700;'},[r.jamMasuk||'—']),
-        el('td',{style:'font-weight:700;'},[r.jamPulang||'—']),
+        jamMasukCell, jamPulangCell,
         el('td',null,[statusBadgeEl]),
       ]));
     });
@@ -2412,7 +2498,7 @@ async function renderRekapAbsensi(body){
       } else if(new Date(dateVal) <= new Date(todayISO())) {
         statusMasuk = 'alpha';
       }
-      return { tanggal:dateVal, nama:p.nama, unit:unitName(p.unitId), jamMasuk: log.masuk?log.masuk.jam:null, jamPulang: log.pulang?log.pulang.jam:null, statusMasuk, shiftNama: shift.libur?'Libur':shift.nama };
+      return { tanggal:dateVal, nama:p.nama, unit:unitName(p.unitId), jamMasuk: log.masuk?log.masuk.jam:null, jamPulang: log.pulang?log.pulang.jam:null, statusMasuk, shiftNama: shift.libur?'Libur':shift.nama, fotoMasuk: log.masuk?log.masuk.foto:null, fotoPulang: log.pulang?log.pulang.foto:null };
     });
     lastJamRows = rows;
     jamDlBtn.style.display = '';
