@@ -987,11 +987,23 @@ function captureSelfie(){
       cleanup(); reject(new Error('Pengambilan foto dibatalkan.'));
     });
 
+    // Tap darurat: kalau video masih belum tampil (hitam), ketuk area kamera untuk memaksa diputar ulang.
+    videoWrap.addEventListener('click', ()=>{ video.play().catch(()=>{}); });
+
     navigator.mediaDevices.getUserMedia({video:{facingMode:'user', width:{ideal:480}, height:{ideal:640}}, audio:false})
       .then(s=>{
         if(settled){ s.getTracks().forEach(t=>t.stop()); return; } // pengguna sempat batal sebelum kamera siap
         stream = s;
         video.srcObject = s;
+        // WAJIB memerintahkan video mulai diputar secara eksplisit — mengandalkan atribut "autoplay" saja
+        // tidak selalu bekerja di sebagian browser/HP Android untuk elemen video yang dibuat lewat JS,
+        // sehingga tampil hitam walau kamera sebenarnya sudah aktif.
+        const playPromise = video.play();
+        if(playPromise && typeof playPromise.catch==='function'){
+          playPromise.catch(()=>{
+            statusMsg.textContent = 'Kamera aktif tapi layar pratinjau belum tampil — ketuk area hitam di atas untuk memulai, lalu tekan Ambil Foto.';
+          });
+        }
         statusMsg.textContent = 'Posisikan wajah Anda di tengah, lalu tekan tombol Ambil Foto.';
         captureBtn.disabled = false;
       })
