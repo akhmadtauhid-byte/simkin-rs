@@ -265,21 +265,40 @@ const LS_PREFIX = 'simkin_rs_';
 const STORAGE_MODE = GAS_WEBAPP_URL ? 'gas'
   : ((typeof window !== 'undefined' && typeof window.storage !== 'undefined' && window.storage !== null) ? 'cloud' : 'local');
 
+/* ---- Status jaringan: dipakai layar Absen Mandiri untuk menampilkan pesan "sedang mencoba lagi..."
+ * alih-alih layar terasa macet/diam saat koneksi lambat, supaya pengguna tidak buru-buru refresh. ---- */
+let _networkStatusListener = null;
+function setNetworkStatusListener(fn){ _networkStatusListener = fn; }
+function notifyNetworkStatus(msg){ if(_networkStatusListener){ try{ _networkStatusListener(msg); }catch(e){} } }
+
+const GAS_FETCH_TIMEOUT_MS = 12000; // per percobaan — cukup longgar untuk koneksi lambat, tapi tidak menggantung selamanya kalau benar-benar putus
+
 async function gasFetch(params, isPost, body){
   // PENTING: penangkal cache (parameter waktu unik + cache:'no-store') HANYA dipasang untuk permintaan GET.
   // Browser TIDAK PERNAH men-cache respons POST secara default, jadi tidak perlu ditangkal — dan menambahkannya ke POST
   // ternyata membuat Google Apps Script gagal memproses pengalihan otomatisnya, menyebabkan diblokir CORS. Ini pelajaran mahal.
-  if(isPost){
-    const url = GAS_WEBAPP_URL;
-    const opts = { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify(body) };
+  const controller = (typeof AbortController!=='undefined') ? new AbortController() : null;
+  const timer = controller ? setTimeout(()=>controller.abort(), GAS_FETCH_TIMEOUT_MS) : null;
+  try{
+    if(isPost){
+      const url = GAS_WEBAPP_URL;
+      const opts = { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify(body) };
+      if(controller) opts.signal = controller.signal;
+      const res = await fetch(url, opts);
+      return await res.json();
+    }
+    const cacheBuster = '_ts=' + Date.now() + Math.random().toString(36).slice(2);
+    const url = GAS_WEBAPP_URL + '?' + new URLSearchParams(params).toString() + '&' + cacheBuster;
+    const opts = { method:'GET', cache:'no-store' };
+    if(controller) opts.signal = controller.signal;
     const res = await fetch(url, opts);
     return await res.json();
+  }catch(e){
+    if(e && e.name==='AbortError') throw new Error('Koneksi terlalu lambat (lebih dari '+(GAS_FETCH_TIMEOUT_MS/1000)+' detik tanpa balasan).');
+    throw e;
+  }finally{
+    if(timer) clearTimeout(timer);
   }
-  const cacheBuster = '_ts=' + Date.now() + Math.random().toString(36).slice(2);
-  const url = GAS_WEBAPP_URL + '?' + new URLSearchParams(params).toString() + '&' + cacheBuster;
-  const opts = { method:'GET', cache:'no-store' };
-  const res = await fetch(url, opts);
-  return await res.json();
 }
 
 /** Diagnostik manual: kirim & ambil data uji ke server, tampilkan setiap langkah apa adanya
@@ -319,31 +338,53 @@ async function testGasConnection(){
 
 const MAX_CELL_CHARS = 40000; // aman di bawah batas 50.000 karakter/sel Google Sheets, dengan margin
 
+// Jeda antar percobaan ulang (makin lama makin panjang) — dipakai semua panggilan baca/tulis ke server.
+// Dengan 4 jeda ini total ada 5 percobaan per panggilan, cukup tahan untuk jaringan lambat/putus-nyambung
+// tanpa membuat pengguna menunggu tanpa batas kalau memang benar-benar tidak ada koneksi.
+const RETRY_DELAYS_MS = [500, 1000, 2000, 3500];
+
 /** Panggilan mentah ke server (tanpa pemecahan) — dipakai internal oleh lapisan chunking di bawah. */
 async function _gasGetRaw(key){
-  for(let attempt=0; attempt<2; attempt++){
+  let lastErr = null;
+  for(let attempt=0; attempt<=RETRY_DELAYS_MS.length; attempt++){
     try{
       const r = await gasFetch({action:'get', key});
       return r.value!==undefined && r.value!==null && r.value!=='' ? r.value : null;
     }catch(e){
-      if(attempt===0) await new Promise(res=>setTimeout(res,400));
-      else throw e;
+      lastErr = e;
+      if(attempt < RETRY_DELAYS_MS.length){
+        notifyNetworkStatus('Jaringan lambat, mencoba lagi… (percobaan '+(attempt+2)+'/'+(RETRY_DELAYS_MS.length+1)+')');
+        await new Promise(res=>setTimeout(res, RETRY_DELAYS_MS[attempt]));
+      }
     }
   }
+  throw lastErr;
 }
 async function _gasSetRaw(key, value){
   let lastErr = null;
-  for(let attempt=0; attempt<2; attempt++){
+  for(let attempt=0; attempt<=RETRY_DELAYS_MS.length; attempt++){
     try{ await gasFetch(null, true, {action:'set', key, value}); return; }
-    catch(e){ lastErr = e; if(attempt===0) await new Promise(res=>setTimeout(res,400)); }
+    catch(e){
+      lastErr = e;
+      if(attempt < RETRY_DELAYS_MS.length){
+        notifyNetworkStatus('Jaringan lambat, mencoba menyimpan lagi… (percobaan '+(attempt+2)+'/'+(RETRY_DELAYS_MS.length+1)+')');
+        await new Promise(res=>setTimeout(res, RETRY_DELAYS_MS[attempt]));
+      }
+    }
   }
   throw new Error('Gagal menyimpan "'+key+'" ke server bersama: '+(lastErr&&lastErr.message||lastErr));
 }
 async function _gasDeleteRaw(key){
   let lastErr = null;
-  for(let attempt=0; attempt<2; attempt++){
+  for(let attempt=0; attempt<=RETRY_DELAYS_MS.length; attempt++){
     try{ await gasFetch(null, true, {action:'delete', key}); return; }
-    catch(e){ lastErr = e; if(attempt===0) await new Promise(res=>setTimeout(res,400)); }
+    catch(e){
+      lastErr = e;
+      if(attempt < RETRY_DELAYS_MS.length){
+        notifyNetworkStatus('Jaringan lambat, mencoba lagi… (percobaan '+(attempt+2)+'/'+(RETRY_DELAYS_MS.length+1)+')');
+        await new Promise(res=>setTimeout(res, RETRY_DELAYS_MS[attempt]));
+      }
+    }
   }
   throw new Error('Gagal menghapus "'+key+'" di server bersama: '+(lastErr&&lastErr.message||lastErr));
 }
@@ -485,6 +526,7 @@ let state = {
   absensiToday: null, // cache status absen hari ini {masuk, pulang}
   absensiBusy: false,
   absensiMsg: null,
+  absensiRetry: null, // {jenis, foto} — foto selfie tersimpan sementara kalau percobaan sebelumnya gagal karena jaringan, agar "Coba Lagi" tak perlu foto ulang
   perUnitWeight: {},            // {unitId: {sikap,kinerja,mutu}} - override per unit, opsional
   tiers: DEFAULT_TIERS,
   loaded: false,
@@ -942,7 +984,10 @@ function getCurrentLocation(){
     navigator.geolocation.getCurrentPosition(
       pos=>resolve({lat:pos.coords.latitude, lng:pos.coords.longitude, akurasi:pos.coords.accuracy}),
       err=>reject(new Error('Gagal mengambil lokasi: '+err.message+'. Pastikan izin lokasi diaktifkan.')),
-      {enableHighAccuracy:true, timeout:15000, maximumAge:0}
+      // timeout diperpanjang & maximumAge diberi sedikit toleransi (bukan 0) — di jaringan/GPS lambat (terutama
+      // dalam gedung yang butuh bantuan sinyal seluler untuk memperkirakan posisi), ini mengurangi kegagalan
+      // tanpa membuat pemeriksaan radius RS jadi tidak berarti.
+      {enableHighAccuracy:true, timeout:25000, maximumAge:8000}
     );
   });
 }
@@ -1085,6 +1130,7 @@ async function getActiveAbsenSession(pegawaiId){
 
 async function doAbsen(pegawaiId, jenis, foto){ // jenis: 'masuk' | 'pulang'; foto: dataURL selfie (opsional, dari captureSelfie)
   const sessionPromise = getActiveAbsenSession(pegawaiId); // mulai diambil dari sekarang, berbarengan dengan proses GPS & verifikasi di bawah
+  notifyNetworkStatus('📍 Mengambil lokasi GPS…');
   const loc = await getLocationWithSpoofCheck();
   if(state.geofence.lat!=null && state.geofence.lng!=null){
     const jarak = distanceMeters(loc.lat, loc.lng, state.geofence.lat, state.geofence.lng);
@@ -1092,8 +1138,10 @@ async function doAbsen(pegawaiId, jenis, foto){ // jenis: 'masuk' | 'pulang'; fo
       throw new Error('Anda berada di luar radius lokasi RS (jarak ±'+Math.round(jarak)+' m, batas '+state.geofence.radius+' m). Absen ditolak.');
     }
   }
+  notifyNetworkStatus('🔐 Memverifikasi identitas…');
   const verified = await verifyIdentityForAbsen(pegawaiId);
   if(!verified) throw new Error('Verifikasi identitas gagal.');
+  notifyNetworkStatus('☁️ Menghubungi server (jangan tutup/refresh halaman)…');
   await sessionPromise; // biarkan pengambilan awal selesai (sudah berjalan sejak awal, berbarengan dengan GPS & verifikasi)
   // Ambil ULANG sesi terbaru tepat sebelum menyimpan — memastikan sungguh-sungguh belum tercatat, mencegah dobel-tekan/kondisi balapan.
   const session = await getActiveAbsenSession(pegawaiId);
@@ -1115,6 +1163,7 @@ async function doAbsen(pegawaiId, jenis, foto){ // jenis: 'masuk' | 'pulang'; fo
   const now = new Date();
   const jam = now.toTimeString().slice(0,5);
   log[jenis] = { jam, lat:loc.lat, lng:loc.lng, akurasi:loc.akurasi, suspicious:loc.suspicious, suspicionFlags:loc.flags, foto: foto||null };
+  notifyNetworkStatus('💾 Menyimpan absen ke server…');
   await saveAbsensiLog(pegawaiId, dateISO, log);
   return log;
 }
@@ -1714,7 +1763,10 @@ async function renderAbsenMandiri(body){
   panel.appendChild(head);
 
   if(state.absensiMsg){
-    panel.appendChild(el('div',{style:'padding:9px 12px;border-radius:8px;font-size:12.5px;font-weight:600;margin-bottom:12px;'+(state.absensiMsg.ok?'background:var(--green-soft);color:var(--green);':'background:var(--red-soft);color:var(--red);')},[state.absensiMsg.text]));
+    const msgStyle = state.absensiMsg.ok===true ? 'background:var(--green-soft);color:var(--green);'
+      : state.absensiMsg.ok===false ? 'background:var(--red-soft);color:var(--red);'
+      : 'background:#eef3fb;color:#2b5a9e;'; // status "sedang berjalan" (netral, bukan berhasil/gagal)
+    panel.appendChild(el('div',{style:'padding:9px 12px;border-radius:8px;font-size:12.5px;font-weight:600;margin-bottom:12px;'+msgStyle},[state.absensiMsg.text]));
   }
 
   if(!fingerprintRegistered(me.id) && !pinRegistered(me.id)){
@@ -1763,24 +1815,50 @@ async function renderAbsenMandiri(body){
   panel.appendChild(todayBox);
 
   const btnRow = el('div',{style:'display:flex;gap:10px;'});
-  const doPunch = async (jenis)=>{
-    state.absensiBusy = true; state.absensiMsg=null; rerender();
+  // reuseFoto: kalau diisi (dari tombol "Coba Lagi" setelah gagal jaringan), TIDAK perlu buka kamera ulang —
+  // ini yang bikin proses jauh lebih tahan jaringan lambat: pegawai tidak perlu ambil foto & verifikasi identitas
+  // dari nol lagi kalau yang gagal cuma langkah kirim ke server.
+  const doPunch = async (jenis, reuseFoto)=>{
+    state.absensiBusy = true; state.absensiMsg = {ok:null, text: reuseFoto ? '🔁 Mencoba lagi…' : '📸 Membuka kamera…'}; rerender();
+    setNetworkStatusListener(msg=>{ state.absensiMsg = {ok:null, text: msg}; rerender(); });
+    let foto = reuseFoto || null;
     try{
-      const foto = await captureSelfie(); // wajib — foto inilah yang jadi bukti kehadiran, bukan tebakan GPS
+      if(!foto){
+        foto = await captureSelfie(); // wajib — foto inilah yang jadi bukti kehadiran, bukan tebakan GPS
+      }
       await doAbsen(me.id, jenis, foto);
       state.absensiMsg = {ok:true, text:'✓ Absen '+(jenis==='masuk'?'Masuk':'Pulang')+' berhasil dicatat pukul '+new Date().toTimeString().slice(0,5)+'.'};
+      state.absensiRetry = null;
     }catch(e){
       state.absensiMsg = {ok:false, text: e.message||'Absen gagal.'};
+      // Simpan foto yang sudah berhasil diambil — kalau gagalnya di langkah jaringan (bukan kamera/lokasi/identitas),
+      // tombol "Coba Lagi" bisa langsung kirim ulang tanpa minta foto selfie & verifikasi dari awal lagi.
+      state.absensiRetry = foto ? {jenis, foto} : null;
     }
+    setNetworkStatusListener(null);
     state.absensiBusy = false; rerender();
   };
   btnRow.appendChild(el('button',{class:'btn btn-primary',style:'flex:1;padding:14px;font-size:14px;', disabled: state.absensiBusy||masukLocked, onclick:()=>doPunch('masuk')},[masukLocked?'🔒 Sudah Absen Masuk':(state.absensiBusy?'Memproses…':'📍 Absen Masuk')]));
   btnRow.appendChild(el('button',{class:'btn btn-gold',style:'flex:1;padding:14px;font-size:14px;', disabled: state.absensiBusy||pulangLocked, onclick:()=>doPunch('pulang')},[pulangLocked?'🔒 Sudah Absen Pulang':(state.absensiBusy?'Memproses…':'📍 Absen Pulang')]));
   panel.appendChild(btnRow);
+
+  // Tombol "Coba Lagi" muncul hanya kalau percobaan sebelumnya gagal SETELAH foto berhasil diambil (biasanya karena
+  // jaringan lambat/putus saat mengirim ke server) — supaya pegawai tidak perlu berfoto & verifikasi ulang dari nol.
+  if(state.absensiRetry && !state.absensiBusy){
+    const rj = state.absensiRetry.jenis;
+    const rLocked = rj==='masuk' ? masukLocked : pulangLocked;
+    if(!rLocked){
+      panel.appendChild(el('button',{class:'btn btn-outline',style:'width:100%;margin-top:10px;padding:12px;font-size:13.5px;', onclick:()=>doPunch(rj, state.absensiRetry.foto)},
+        ['🔁 Coba Lagi Kirim Absen '+(rj==='masuk'?'Masuk':'Pulang')+' (pakai foto yang sama, tanpa foto ulang)']));
+    } else {
+      state.absensiRetry = null; // sesi sudah terkunci lewat jalur lain, retry lama sudah tidak relevan
+    }
+  }
+
   if(masukLocked || pulangLocked){
     panel.appendChild(el('div',{class:'small-note',style:'margin-top:10px;'},['Absen yang sudah tercatat hari ini terkunci dan tidak bisa ditimpa/diubah lagi — kalau ada kesalahan, hubungi Kepala Unit/Admin.']));
   } else {
-    panel.appendChild(el('div',{class:'small-note',style:'margin-top:10px;'},['Menekan tombol akan meminta foto selfie, izin lokasi, & verifikasi sidik jari perangkat. Absen ditolak otomatis kalau berada di luar radius lokasi RS yang ditetapkan Admin.']));
+    panel.appendChild(el('div',{class:'small-note',style:'margin-top:10px;'},['Menekan tombol akan meminta foto selfie, izin lokasi, & verifikasi sidik jari perangkat. Absen ditolak otomatis kalau berada di luar radius lokasi RS yang ditetapkan Admin. Kalau jaringan lambat, tunggu saja — sistem otomatis mencoba lagi beberapa kali; jangan tutup atau refresh halaman selama proses berjalan.']));
   }
 
   body.appendChild(panel);
