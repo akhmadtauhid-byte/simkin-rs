@@ -273,12 +273,13 @@ function notifyNetworkStatus(msg){ if(_networkStatusListener){ try{ _networkStat
 
 const GAS_FETCH_TIMEOUT_MS = 12000; // per percobaan — cukup longgar untuk koneksi lambat, tapi tidak menggantung selamanya kalau benar-benar putus
 
-async function gasFetch(params, isPost, body){
+async function gasFetch(params, isPost, body, timeoutMsOverride){
   // PENTING: penangkal cache (parameter waktu unik + cache:'no-store') HANYA dipasang untuk permintaan GET.
   // Browser TIDAK PERNAH men-cache respons POST secara default, jadi tidak perlu ditangkal — dan menambahkannya ke POST
   // ternyata membuat Google Apps Script gagal memproses pengalihan otomatisnya, menyebabkan diblokir CORS. Ini pelajaran mahal.
+  const timeoutMs = timeoutMsOverride || GAS_FETCH_TIMEOUT_MS;
   const controller = (typeof AbortController!=='undefined') ? new AbortController() : null;
-  const timer = controller ? setTimeout(()=>controller.abort(), GAS_FETCH_TIMEOUT_MS) : null;
+  const timer = controller ? setTimeout(()=>controller.abort(), timeoutMs) : null;
   try{
     if(isPost){
       const url = GAS_WEBAPP_URL;
@@ -294,7 +295,7 @@ async function gasFetch(params, isPost, body){
     const res = await fetch(url, opts);
     return await res.json();
   }catch(e){
-    if(e && e.name==='AbortError') throw new Error('Koneksi terlalu lambat (lebih dari '+(GAS_FETCH_TIMEOUT_MS/1000)+' detik tanpa balasan).');
+    if(e && e.name==='AbortError') throw new Error('Koneksi terlalu lambat (lebih dari '+(timeoutMs/1000)+' detik tanpa balasan).');
     throw e;
   }finally{
     if(timer) clearTimeout(timer);
@@ -343,12 +344,19 @@ const MAX_CELL_CHARS = 40000; // aman di bawah batas 50.000 karakter/sel Google 
 // tanpa membuat pengguna menunggu tanpa batas kalau memang benar-benar tidak ada koneksi.
 const RETRY_DELAYS_MS = [500, 1000, 2000, 3500];
 
+// Statistik keberhasilan/kegagalan panggilan mentah ke server — dipakai loadAll() untuk mendeteksi server benar-benar
+// tidak terjangkau (BUKAN cuma "data belum ada"), karena Storage.get menelan error secara diam-diam dan jatuh ke
+// cache lokal, jadi tidak bisa dideteksi lewat try/catch biasa di pemanggilnya.
+let _gasStats = {ok:0, fail:0};
+function resetGasStats(){ _gasStats = {ok:0, fail:0}; }
+
 /** Panggilan mentah ke server (tanpa pemecahan) — dipakai internal oleh lapisan chunking di bawah. */
 async function _gasGetRaw(key){
   let lastErr = null;
   for(let attempt=0; attempt<=RETRY_DELAYS_MS.length; attempt++){
     try{
       const r = await gasFetch({action:'get', key});
+      _gasStats.ok++;
       return r.value!==undefined && r.value!==null && r.value!=='' ? r.value : null;
     }catch(e){
       lastErr = e;
@@ -358,12 +366,13 @@ async function _gasGetRaw(key){
       }
     }
   }
+  _gasStats.fail++;
   throw lastErr;
 }
 async function _gasSetRaw(key, value){
   let lastErr = null;
   for(let attempt=0; attempt<=RETRY_DELAYS_MS.length; attempt++){
-    try{ await gasFetch(null, true, {action:'set', key, value}); return; }
+    try{ await gasFetch(null, true, {action:'set', key, value}); _gasStats.ok++; return; }
     catch(e){
       lastErr = e;
       if(attempt < RETRY_DELAYS_MS.length){
@@ -372,12 +381,13 @@ async function _gasSetRaw(key, value){
       }
     }
   }
+  _gasStats.fail++;
   throw new Error('Gagal menyimpan "'+key+'" ke server bersama: '+(lastErr&&lastErr.message||lastErr));
 }
 async function _gasDeleteRaw(key){
   let lastErr = null;
   for(let attempt=0; attempt<=RETRY_DELAYS_MS.length; attempt++){
-    try{ await gasFetch(null, true, {action:'delete', key}); return; }
+    try{ await gasFetch(null, true, {action:'delete', key}); _gasStats.ok++; return; }
     catch(e){
       lastErr = e;
       if(attempt < RETRY_DELAYS_MS.length){
@@ -386,6 +396,7 @@ async function _gasDeleteRaw(key){
       }
     }
   }
+  _gasStats.fail++;
   throw new Error('Gagal menghapus "'+key+'" di server bersama: '+(lastErr&&lastErr.message||lastErr));
 }
 
@@ -527,6 +538,9 @@ let state = {
   absensiBusy: false,
   absensiMsg: null,
   absensiRetry: null, // {jenis, foto} — foto selfie tersimpan sementara kalau percobaan sebelumnya gagal karena jaringan, agar "Coba Lagi" tak perlu foto ulang
+  serverOnline: true, // null=belum diketahui, false=loadAll() barusan gagal total — dipakai menampilkan pita "sedang menyambung ulang" di atas layar
+  serverRetryCount: 0,
+  cleanupBusy: false, cleanupResult: null, cleanupCutoff: null, // status tombol "Bersihkan Log Absensi Lama" di Pengaturan Bobot
   perUnitWeight: {},            // {unitId: {sikap,kinerja,mutu}} - override per unit, opsional
   tiers: DEFAULT_TIERS,
   loaded: false,
@@ -684,6 +698,10 @@ async function loadAll(){
 
   // Semua konfigurasi dasar dimuat BERSAMAAN (bukan satu-satu) — inilah yang mempercepat waktu masuk aplikasi.
   // PENTING: kalau pengambilan gagal/kosong, JANGAN timpa data yang sudah ada (dari cache/sesi sebelumnya) — biarkan apa adanya.
+  // Storage.get menelan error dan jatuh ke cache lokal secara diam-diam (supaya app tidak pernah crash gara-gara
+  // jaringan), jadi status online/offline TIDAK bisa dideteksi lewat try/catch biasa di sini — makanya dipantau lewat
+  // _gasStats (dihitung di level paling bawah, _gasGetRaw/_gasSetRaw/_gasDeleteRaw) alih-alih try/catch lokal.
+  resetGasStats();
   await Promise.all([
     (async ()=>{
       try{
@@ -768,6 +786,34 @@ async function loadAll(){
   await loadPenilaianForPeriode(state.periode);
   state.loaded = true;
   saveToLocalCache(); // simpan hasil terbaru untuk mempercepat kunjungan berikutnya
+
+  if(STORAGE_MODE==='gas' && _gasStats.ok===0 && _gasStats.fail>0){
+    // TIDAK SATU PUN panggilan ke server yang berhasil (semuanya gagal setelah 5x percobaan tiap panggilan) —
+    // server kemungkinan besar sedang tidak terjangkau/lambat sekali. Tampilkan pita status (data yang ditampilkan
+    // tetap yang tersimpan lokal terakhir) & jadwalkan percobaan ulang otomatis di latar belakang, TANPA memaksa
+    // pengguna menutup/refresh halaman berulang kali.
+    state.serverOnline = false;
+    state.serverRetryCount++;
+    scheduleBackgroundReload();
+  } else {
+    const wasOffline = state.serverOnline===false;
+    state.serverOnline = true;
+    state.serverRetryCount = 0;
+    if(wasOffline) rerender(); // baru pulih — segera hilangkan pita status tanpa menunggu aksi pengguna berikutnya
+  }
+}
+
+let _bgReloadTimer = null;
+function scheduleBackgroundReload(){
+  if(_bgReloadTimer) return; // sudah ada percobaan terjadwal, jangan tumpuk-tumpuk
+  // Jeda makin panjang tiap percobaan gagal berturut-turut (maks 30 detik) — tidak membebani server yang sedang berat,
+  // tapi tetap cukup responsif begitu koneksi pulih.
+  const delayMs = Math.min(5000 * state.serverRetryCount, 30000);
+  _bgReloadTimer = setTimeout(async ()=>{
+    _bgReloadTimer = null;
+    try{ await loadAll(); }catch(e){}
+    rerender();
+  }, delayMs);
 }
 
 async function loadPenilaianForPeriode(periode){
@@ -1523,6 +1569,10 @@ async function render(){
 
   /* main */
   const main = el('div',{class:'main'});
+  if(state.serverOnline===false){
+    main.appendChild(el('div',{style:'background:#FFF3CD;color:#7A5B00;padding:8px 14px;border-radius:8px;font-size:12px;font-weight:600;margin-bottom:10px;display:flex;align-items:center;gap:8px;'},
+      ['🔄 Koneksi ke server bermasalah — menampilkan data tersimpan terakhir di perangkat ini. Sistem otomatis mencoba menyambung ulang di latar belakang'+(state.serverRetryCount?' (percobaan ke-'+state.serverRetryCount+')':'')+'…']));
+  }
   const topbar = el('div',{class:'topbar'});
   const titles = {
     dashboard:['Dashboard', state.role==='unit' ? 'Ringkasan status penilaian unit '+unitName(state.currentUnitId) : 'Ringkasan status penilaian & validasi'],
@@ -3403,6 +3453,38 @@ function renderPengaturan(body){
       panelDiag.appendChild(box);
     }
     body.appendChild(panelDiag);
+  }
+
+  /* Bersihkan Log Absensi Lama — "sistem turbo": KV_Store yang terus membengkak (log absensi harian menumpuk
+   * tanpa batas) adalah penyebab utama server terasa lambat/macet saat banyak pegawai absen bersamaan, karena
+   * setiap pembacaan/penulisan harus memindai seluruh baris. Ini SATU-SATUNYA aksi yang menghapus data permanen
+   * di sini, dan HANYA menghapus key berpola "absensi-log:...:YYYY-MM-DD" yang lebih tua dari tanggal batas —
+   * data pegawai/unit/penilaian/pengaturan lain sama sekali tidak tersentuh. */
+  if(STORAGE_MODE==='gas'){
+    const panelClean = el('div',{class:'panel',style:'border-color:var(--red);'});
+    panelClean.appendChild(el('h3',null,['🧹 Bersihkan Log Absensi Lama (Sistem Turbo)']));
+    panelClean.appendChild(el('div',{class:'small-note',style:'margin-bottom:12px;'},['Log jam datang/pulang harian menumpuk terus setiap hari dan membuat server makin lambat lama-kelamaan (server harus memindai semua baris setiap kali ada yang absen). Hapus log yang lebih lama dari tanggal di bawah ini untuk mempercepat sistem kembali. Rekap yang sudah diunduh ke Excel sebelumnya TIDAK terpengaruh — hanya data mentah di server yang dihapus. Data pegawai, unit, dan penilaian TIDAK ikut terhapus.']));
+    const cutoffDefault = (()=>{ const d=new Date(); d.setMonth(d.getMonth()-2); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); })();
+    const cutoffRow = el('div',{style:'display:flex;gap:10px;align-items:center;flex-wrap:wrap;'});
+    const cutoffInp = el('input',{type:'date', value: state.cleanupCutoff || cutoffDefault, style:'padding:8px 10px;border:1px solid var(--line);border-radius:7px;', onchange:(e)=>{ state.cleanupCutoff = e.target.value; }});
+    cutoffRow.appendChild(el('div',null,[el('div',{style:'font-size:11px;color:var(--ink-soft);margin-bottom:3px;'},['Hapus log SEBELUM tanggal:']), cutoffInp]));
+    const cleanBtn = el('button',{class:'btn btn-outline',style:'border-color:var(--red);color:var(--red);', disabled: state.cleanupBusy, onclick: async ()=>{
+      const cutoff = cutoffInp.value || cutoffDefault;
+      if(!confirm('Hapus SEMUA log absensi harian sebelum tanggal '+cutoff+' dari server?\n\nTindakan ini PERMANEN dan tidak bisa dibatalkan. Data pegawai/unit/penilaian tidak terpengaruh.')) return;
+      state.cleanupBusy = true; state.cleanupResult = null; rerender();
+      try{
+        const res = await gasFetch(null, true, {action:'cleanup', cutoffDateISO: cutoff}, 45000); // bisa memproses ribuan baris — beri waktu lebih longgar dari permintaan biasa
+        if(res && res.ok){ state.cleanupResult = {ok:true, text:'✓ Selesai: '+res.deleted+' baris log lama dihapus, '+res.kept+' baris tersisa di server.'}; }
+        else { state.cleanupResult = {ok:false, text:'❌ '+(res&&res.error||'Gagal membersihkan.')}; }
+      }catch(e){ state.cleanupResult = {ok:false, text:'❌ Gagal menghubungi server: '+(e.message||e)}; }
+      state.cleanupBusy = false; rerender();
+    }},[state.cleanupBusy?'Membersihkan…':'🗑️ Hapus Log Lama']);
+    cutoffRow.appendChild(cleanBtn);
+    panelClean.appendChild(cutoffRow);
+    if(state.cleanupResult){
+      panelClean.appendChild(el('div',{style:'margin-top:10px;padding:9px 12px;border-radius:8px;font-size:12.5px;font-weight:600;'+(state.cleanupResult.ok?'background:var(--green-soft);color:var(--green);':'background:var(--red-soft);color:var(--red);')},[state.cleanupResult.text]));
+    }
+    body.appendChild(panelClean);
   }
 
   /* Lokasi RS (Geofence) & Jadwal Kerja untuk Absen Mandiri */
