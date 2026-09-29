@@ -1777,10 +1777,8 @@ async function renderAbsenMandiri(body){
     panel.appendChild(searchInp);
     const results = el('div',{style:'margin-top:10px;'});
     panel.appendChild(results);
-    const renderResults = (q)=>{
+    const showMatches = (matches)=>{
       results.innerHTML='';
-      if(!q || q.trim().length<2) return;
-      const matches = state.pegawai.filter(p=>p.nama.toLowerCase().includes(q.toLowerCase())).slice(0,8);
       if(matches.length===0){ results.appendChild(el('div',{class:'small-note'},['Nama tidak ditemukan. Pastikan sudah terdaftar oleh Admin.'])); return; }
       matches.forEach(p=>{
         const row = el('div',{style:'padding:10px 12px;border:1px solid var(--line);border-radius:8px;margin-bottom:6px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;', onclick:()=>{
@@ -1793,6 +1791,27 @@ async function renderAbsenMandiri(body){
         ]);
         results.appendChild(row);
       });
+    };
+    const findMatches = (q)=> state.pegawai.filter(p=>p.nama.toLowerCase().includes(q.toLowerCase())).slice(0,8);
+    let _refreshedForQuery = null; // hindari memuat ulang berkali-kali untuk pencarian yang sama
+    const renderResults = async (q)=>{
+      if(!q || q.trim().length<2){ results.innerHTML=''; return; }
+      let matches = findMatches(q);
+      if(matches.length===0 && _refreshedForQuery!==q){
+        // Tidak ketemu — kemungkinan perangkat ini memakai salinan data pegawai yang sudah usang (belum sempat
+        // sinkron ulang sejak terakhir dibuka), BUKAN berarti pegawainya benar-benar tidak terdaftar. Coba muat
+        // ulang data terbaru dari server dulu SEBELUM benar-benar menyerah dengan pesan "tidak ditemukan".
+        _refreshedForQuery = q;
+        results.innerHTML='';
+        results.appendChild(el('div',{class:'small-note'},['🔄 Nama belum terlihat — memuat data pegawai terbaru dari server…']));
+        try{
+          const p = await Storage.get('pegawai-list', true);
+          if(p && p.value){ state.pegawai = JSON.parse(p.value); }
+        }catch(e){ /* gagal muat ulang — lanjut pakai data yang ada, tampilkan hasil apa adanya di bawah */ }
+        if(searchInp.value !== q) return; // pengguna sudah mengetik lagi sejak permintaan ini dimulai — biarkan renderResults yang lebih baru yang menampilkan hasil
+        matches = findMatches(q);
+      }
+      showMatches(matches);
     };
     searchInp.addEventListener('input', e=>renderResults(e.target.value));
     body.appendChild(panel);
