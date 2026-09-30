@@ -2220,6 +2220,7 @@ function renderPegawai(body){
         el('td',null,[shiftSel]),
         el('td',null,[p.tukin_maks? Number(p.tukin_maks).toLocaleString('id-ID') : '-']),
         el('td',null,[
+          el('button',{class:'btn btn-outline btn-sm',style:'margin-right:6px;', title:'Unduh laporan penilaian (Word, bisa diedit) periode '+state.periode+' — untuk bukti akreditasi', onclick:()=>{ downloadLaporanSatuPegawai(p.id); }},['📄']),
           el('button',{class:'btn btn-outline btn-sm',style:'margin-right:6px;', onclick:()=>{ state.modal={type:'edit_pegawai', pegawaiId:p.id}; rerender(); }},['Edit']),
           el('button',{class:'btn btn-outline btn-sm', onclick:()=>{
             if(confirm('Hapus pegawai '+p.nama+'?')){
@@ -3296,6 +3297,127 @@ function exportRekapExcel(finals, periode){
   XLSX.writeFile(wb, 'Rekap-Tukin-'+periode.replace(/\s+/g,'-')+'.xlsx');
 }
 
+/* ============ LAPORAN PENILAIAN PER PEGAWAI (Word/.doc — untuk bukti akreditasi KARS/STARKES) ============ */
+function escapeHtmlDoc(s){
+  return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+/** Bungkus konten HTML jadi dokumen yang dikenali Microsoft Word saat dibuka (format "Word HTML"). */
+function wordDocWrapper(bodyHtml){
+  return '<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40">'
+    +'<head><meta charset="utf-8">'
+    +'<!--[if gte mso 9]><xml><w:WordDocument><w:View>Print</w:View><w:Zoom>100</w:Zoom><w:DoNotOptimizeForBrowser/></w:WordDocument></xml><![endif]-->'
+    +'<style>'
+    +'@page{size:21cm 29.7cm;margin:2cm 1.8cm 2cm 1.8cm;}'
+    +'body{font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;}'
+    +'table{border-collapse:collapse;width:100%;margin-bottom:10px;}'
+    +'td,th{border:1px solid #444;padding:5px 8px;font-size:10.5pt;vertical-align:top;}'
+    +'th{background:#EDEDED;text-align:left;}'
+    +'h1{font-size:15pt;text-align:center;margin:0 0 2px;}'
+    +'h2{font-size:12.5pt;text-align:center;margin:0 0 14px;text-transform:uppercase;font-weight:normal;}'
+    +'.sub-center{text-align:center;font-size:10.5pt;margin-bottom:16px;}'
+    +'.report-page{page-break-after:always;}'
+    +'.report-page:last-child{page-break-after:auto;}'
+    +'</style></head><body>'+bodyHtml+'</body></html>';
+}
+/** Picu unduhan file .doc (Word) lewat Blob — berjalan sepenuhnya di perangkat, tidak butuh koneksi server. */
+function triggerWordDownload(filename, bodyHtml){
+  const html = wordDocWrapper(bodyHtml);
+  const blob = new Blob(['﻿', html], {type:'application/msword;charset=utf-8'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click();
+  setTimeout(()=>{ try{ document.body.removeChild(a); }catch(e){} URL.revokeObjectURL(url); }, 1000);
+}
+function aspekRowsHtml(aspekList, scoreObj, subW){
+  if(!aspekList || aspekList.length===0) return '<tr><td colspan="3" style="text-align:center;color:#777;">— Belum ada aspek —</td></tr>';
+  return aspekList.map(a=>{
+    const val = (scoreObj && typeof scoreObj[a.key]==='number') ? scoreObj[a.key] : null;
+    const w = (subW && typeof subW[a.key]==='number') ? subW[a.key] : Math.round(100/aspekList.length);
+    return '<tr><td>'+escapeHtmlDoc(a.nama)+(a.type==='auto'?' <i>(Otomatis dari absensi)</i>':'')+'</td>'
+      +'<td style="text-align:center;">'+w+'%</td>'
+      +'<td style="text-align:center;">'+(val!==null? val+' / 4' : '-')+'</td></tr>';
+  }).join('');
+}
+function signatureBlockHtml(){
+  const roles = ['Kepala Unit','Manajer HRD & Diklat','Direktur RSU Allam Medica'];
+  return '<table style="width:100%;border:none;margin-top:36px;">'
+    +'<tr>'+roles.map(role=>(
+      '<td style="border:none;text-align:center;width:33%;padding:0 6px;">'
+      +'<div style="border-top:1px solid #000;margin-top:60px;padding-top:4px;">'+escapeHtmlDoc(role)+'</div>'
+      +'</td>'
+    )).join('')+'</tr></table>';
+}
+/** Susun satu halaman laporan penilaian untuk satu pegawai pada satu periode — dipakai baik untuk unduhan satuan maupun massal. */
+function buildLaporanPegawaiSectionHtml(p, pn, f, periode){
+  const w = f.weightUsed;
+  const sikapRows = aspekRowsHtml(state.aspekConfig.sikap, f.sikapCombined, state.subWeight.sikap);
+  const kinerjaRows = aspekRowsHtml(state.aspekConfig.kinerja, pn.kinerja_score, state.subWeight.kinerja);
+  const mutuRows = aspekRowsHtml(state.aspekConfig.mutu, pn.mutu_score, state.subWeight.mutu);
+  const isFinal = pn.status==='FINAL';
+  const nominal = (isFinal && p.tukin_maks) ? Math.round(Number(p.tukin_maks||0) * f.tier.persen/100) : null;
+
+  let html = '<div class="report-page">';
+  html += '<h1>RSU ALLAM MEDICA</h1>';
+  html += '<h2>Laporan Hasil Penilaian Kinerja Pegawai</h2>';
+  html += '<div class="sub-center">Periode: <b>'+escapeHtmlDoc(periode)+'</b> &nbsp;|&nbsp; Dicetak: '+escapeHtmlDoc(new Date().toLocaleString('id-ID'))+'</div>';
+
+  html += '<table><tr><th style="width:28%;">Nama Pegawai</th><td>'+escapeHtmlDoc(p.nama)+'</td></tr>'
+    +'<tr><th>Unit</th><td>'+escapeHtmlDoc(unitName(p.unitId))+'</td></tr>'
+    +'<tr><th>Jabatan</th><td>'+escapeHtmlDoc(p.jabatan||'-')+'</td></tr>'
+    +'<tr><th>Status Kepegawaian</th><td>'+escapeHtmlDoc(p.statusKepegawaian||'-')+'</td></tr>'
+    +'<tr><th>Status Penilaian</th><td>'+escapeHtmlDoc(STATUS_LABEL[pn.status]||pn.status)+'</td></tr></table>';
+
+  html += '<h3 style="font-size:11.5pt;margin:14px 0 4px;">1. Sikap Kerja (Bobot Komponen: '+w.sikap+'%)</h3>';
+  html += '<table><tr><th>Aspek</th><th style="width:15%;">Bobot</th><th style="width:18%;">Skor (1-4)</th></tr>'+sikapRows+'</table>';
+
+  html += '<h3 style="font-size:11.5pt;margin:14px 0 4px;">2. Kinerja Pelayanan (Bobot Komponen: '+w.kinerja+'%)</h3>';
+  html += '<table><tr><th>Aspek</th><th style="width:15%;">Bobot</th><th style="width:18%;">Skor (1-4)</th></tr>'+kinerjaRows+'</table>';
+
+  html += '<h3 style="font-size:11.5pt;margin:14px 0 4px;">3. Mutu Pelayanan (Bobot Komponen: '+w.mutu+'%)</h3>';
+  html += '<table><tr><th>Aspek</th><th style="width:15%;">Bobot</th><th style="width:18%;">Skor (1-4)</th></tr>'+mutuRows+'</table>';
+
+  html += '<h3 style="font-size:11.5pt;margin:14px 0 4px;">Ringkasan Hasil</h3>';
+  html += '<table>'
+    +'<tr><th style="width:28%;">Rata-rata Sikap Kerja</th><td>'+(f.sikapAvg!==null? f.sikapAvg.toFixed(2)+' / 4':'-')+'</td></tr>'
+    +'<tr><th>Rata-rata Kinerja Pelayanan</th><td>'+(f.kinerjaAvg!==null? f.kinerjaAvg.toFixed(2)+' / 4':'-')+'</td></tr>'
+    +'<tr><th>Rata-rata Mutu Pelayanan</th><td>'+(f.mutuAvg!==null? f.mutuAvg.toFixed(2)+' / 4':'-')+'</td></tr>'
+    +'<tr><th>Skor Akhir</th><td><b>'+(isFinal? f.percent.toFixed(1)+'%':(f.complete? f.percent.toFixed(1)+'% (belum berstatus Final)':'Belum lengkap'))+'</b></td></tr>'
+    +'<tr><th>Grade</th><td>'+(isFinal? f.tier.grade : '-')+'</td></tr>'
+    +'<tr><th>% Tunjangan Kinerja (Tukin)</th><td>'+(isFinal? f.tier.persen+'%':'-')+'</td></tr>'
+    +'<tr><th>Nominal Tukin</th><td>'+(nominal!==null? 'Rp '+nominal.toLocaleString('id-ID'):'-')+'</td></tr>'
+    +'</table>';
+
+  if((pn.catatan_hrd||'').trim() || (pn.catatan_diklat||'').trim()){
+    html += '<h3 style="font-size:11.5pt;margin:14px 0 4px;">Catatan</h3><table>';
+    if((pn.catatan_hrd||'').trim()) html += '<tr><th style="width:28%;">Catatan HRD</th><td>'+escapeHtmlDoc(pn.catatan_hrd)+'</td></tr>';
+    if((pn.catatan_diklat||'').trim()) html += '<tr><th>Catatan Diklat</th><td>'+escapeHtmlDoc(pn.catatan_diklat)+'</td></tr>';
+    html += '</table>';
+  }
+
+  html += '<div style="font-size:9.5pt;color:#555;margin-top:6px;">Dokumen ini dapat diedit langsung di Microsoft Word dan dapat digunakan sebagai bukti dokumentasi akreditasi (KARS/STARKES).</div>';
+  html += signatureBlockHtml();
+  html += '</div>';
+  return html;
+}
+/** Unduh laporan Word untuk SATU pegawai, periode yang sedang aktif dipilih di sistem. */
+function downloadLaporanSatuPegawai(pegawaiId){
+  const p = state.pegawai.find(x=>x.id===pegawaiId);
+  if(!p){ alert('Pegawai tidak ditemukan.'); return; }
+  const pn = getPenilaian(state.periode, p.id);
+  const f = computeFinal(pn, p.unitId);
+  const html = buildLaporanPegawaiSectionHtml(p, pn, f, state.periode);
+  const safeName = p.nama.replace(/[^a-zA-Z0-9]+/g,'-');
+  triggerWordDownload('Laporan-Penilaian-'+safeName+'-'+state.periode.replace(/[^a-zA-Z0-9]+/g,'-')+'.doc', html);
+}
+/** Unduh laporan Word MASSAL — satu file berisi laporan tiap pegawai di `list` (masing-masing di halaman terpisah). */
+function downloadLaporanMassal(list, periode){
+  if(list.length===0){ alert('Tidak ada pegawai untuk diunduh (sesuai pencarian/filter unit saat ini).'); return; }
+  if(!confirm('Unduh laporan Word untuk '+list.length+' pegawai (periode '+periode+') dalam satu file, tiap pegawai pada halaman terpisah?')) return;
+  const sections = list.map(({p,pn,f})=>buildLaporanPegawaiSectionHtml(p, pn, f, periode)).join('');
+  triggerWordDownload('Laporan-Penilaian-Massal-'+periode.replace(/[^a-zA-Z0-9]+/g,'-')+'.doc', sections);
+}
+
 function renderRekap(body){
   const finals = state.pegawai.map(p=>({p, pn:getPenilaian(state.periode,p.id)}))
     .map(x=>({...x, f:computeFinal(x.pn, x.p.unitId)}));
@@ -3323,6 +3445,7 @@ function renderRekap(body){
   headRow.appendChild(el('h3',{style:'margin:0;'},['Rekap Penilaian & Tukin — Periode '+state.periode]));
   const btnRow = el('div',{style:'display:flex;gap:8px;'});
   btnRow.appendChild(el('button',{class:'btn btn-outline btn-sm', onclick:()=>{ exportRekapExcel(finalsFiltered, state.periode); }},['💾 Unduh Excel']));
+  btnRow.appendChild(el('button',{class:'btn btn-outline btn-sm', title:'Unduh laporan penilaian tiap pegawai (bisa diedit) dalam 1 file Word — untuk bukti akreditasi', onclick:()=>{ downloadLaporanMassal(finalsFiltered, state.periode); }},['📄 Unduh Laporan Word (Massal)']));
   btnRow.appendChild(el('button',{class:'btn btn-gold btn-sm', onclick:()=>{ window.print(); }},['🖨️ Cetak']));
   headRow.appendChild(btnRow);
   panel.appendChild(headRow);
