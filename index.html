@@ -468,7 +468,18 @@ const Storage = {
       try{
         const value = await _gasGetChunked(key);
         return value!==null ? {key, value, shared} : null;
-      }catch(e){ /* jatuhkan ke lokal di bawah kalau server benar-benar tidak terjangkau */ }
+      }catch(e){
+        // Server benar-benar tidak terjangkau setelah semua percobaan ulang. SENGAJA TIDAK jatuh ke
+        // localStorage per-key di bawah: pada mode 'gas', key ini TIDAK PERNAH ditulis ke localStorage
+        // (lihat Storage.set) — jadi kalau pun ada isinya di sana, itu peninggalan lama (mis. dari masa
+        // sebelum GAS_WEBAPP_URL dipasang) yang bisa jauh lebih basi dari data sebenarnya. Ini pernah
+        // menyebabkan pegawai yang sudah dihapus (data dummy) muncul lagi dan rekap absen tampak kosong
+        // untuk semua orang, karena ID pegawai dari data basi itu tidak lagi cocok dengan log absen yang
+        // tersimpan di server. Lebih aman kembalikan null: pemanggil (loadAll, dst.) sudah dirancang untuk
+        // MEMPERTAHANKAN data yang sudah ada di memori/snapshot (loadFromLocalCache) alih-alih menimpanya
+        // dengan sesuatu yang salah.
+        return null;
+      }
     } else if(STORAGE_MODE==='cloud'){
       try{ return await window.storage.get(key, shared); }catch(e){ /* jatuhkan ke lokal */ }
     }
