@@ -1259,10 +1259,12 @@ function isoDateOffset(days){
  * berjalan (bukan hari baru yang kosong), supaya Absen Pulang tercatat menyambung ke masuknya semalam. */
 async function getActiveAbsenSession(pegawaiId){
   const today = todayISO();
-  const todayLog = await getAbsensiLog(pegawaiId, today);
-  if(todayLog.masuk) return {dateISO: today, log: todayLog};
   const yISO = isoDateOffset(-1);
-  const yLog = await getAbsensiLog(pegawaiId, yISO);
+  // Ambil log HARI INI & KEMARIN BERSAMAAN (bukan berurutan) — sebelumnya kemarin baru dicek SETELAH hari ini
+  // selesai, jadi pegawai shift malam (masuk kemarin, pulang baru pagi ini — log hari ini otomatis kosong)
+  // selalu menunggu DUA KALI LIPAT lebih lama dibanding pegawai shift biasa. Sekarang keduanya sama-sama cepat.
+  const [todayLog, yLog] = await Promise.all([getAbsensiLog(pegawaiId, today), getAbsensiLog(pegawaiId, yISO)]);
+  if(todayLog.masuk) return {dateISO: today, log: todayLog};
   if(yLog.masuk && !yLog.pulang) return {dateISO: yISO, log: yLog};
   return {dateISO: today, log: todayLog};
 }
@@ -1951,6 +1953,14 @@ async function renderAbsenMandiri(body){
     panel.appendChild(buildPinCard(me));
   }
 
+  // PENTING: tampilkan panel (nama, tombol Ganti, dsb.) SEKARANG JUGA, sebelum menunggu status sesi absen dari
+  // server — sebelumnya panel baru ditempel ke layar di akhir fungsi ini, jadi kalau jaringan lambat, layar
+  // terlihat kosong/macet total (tidak ada tanda apa pun sedang memuat) selama menunggu. Dengan ditempel lebih
+  // awal + catatan "Memuat…", pegawai tahu sistem sedang bekerja, bukan macet, walau jaringannya lambat.
+  const loadingNote = el('div',{class:'small-note',style:'margin-top:4px;'},['⏳ Memuat status absen hari ini…']);
+  panel.appendChild(loadingNote);
+  body.appendChild(panel);
+
   // Ambil status sesi aktif LEBIH DULU (sebelum tombol dibangun) — supaya kalau sudah absen, tombolnya
   // langsung terlihat terkunci sejak awal, bukan baru terkunci setelah ditekan. Pakai sesi aktif (bukan
   // cuma tanggal hari ini) supaya shift malam yang melewati tengah malam tetap terdeteksi dengan benar.
@@ -1958,6 +1968,7 @@ async function renderAbsenMandiri(body){
     getActiveAbsenSession(me.id),
     getShiftForDate(me.id, todayISO()),
   ]);
+  panel.removeChild(loadingNote);
   const sessionLog = session.log;
   const isOvernightSession = session.dateISO !== todayISO();
   const masukLocked = !!sessionLog.masuk; // kalau ada sesi aktif (hari ini ATAU sisa kemarin yang belum ditutup), Masuk terkunci
@@ -2023,8 +2034,7 @@ async function renderAbsenMandiri(body){
   } else {
     panel.appendChild(el('div',{class:'small-note',style:'margin-top:10px;'},['Menekan tombol akan meminta foto selfie, izin lokasi, & verifikasi sidik jari perangkat. Absen ditolak otomatis kalau berada di luar radius lokasi RS yang ditetapkan Admin. Kalau jaringan lambat, tunggu saja — sistem otomatis mencoba lagi beberapa kali; jangan tutup atau refresh halaman selama proses berjalan.']));
   }
-
-  body.appendChild(panel);
+  // (panel sudah ditempel ke body lebih awal, sebelum menunggu status sesi — lihat komentar di atas)
 }
 
 /* ============ LOGIN UNIT ============ */
