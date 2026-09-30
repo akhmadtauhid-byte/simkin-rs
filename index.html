@@ -2922,7 +2922,17 @@ async function renderRekapAbsensi(body){
     detailDlBtn.textContent = '📑 Unduh Detail Harian (Excel)';
   });
 
-  await loadAndRender(); // langsung tampil begitu halaman dibuka, dengan rentang default (awal bulan s/d hari ini)
+  // Auto-muat hanya jika jumlah pegawai cukup kecil (unit tunggal, dsb).
+  // Untuk "Semua Unit" / pool besar, proses rentang-tanggal ini bisa memakan waktu lama
+  // (menghitung ulang tiap kali tab dibuka), jadi biarkan admin menekan "Tampilkan" sendiri
+  // supaya jelas kapan proses berat itu berjalan, bukan diam-diam saat halaman dibuka.
+  if(staffPool.length<=50){
+    await loadAndRender();
+  } else {
+    resultBox.appendChild(el('div',{class:'empty'},[
+      'Ada '+staffPool.length+' pegawai pada pilihan saat ini. Klik "🔄 Tampilkan" di atas untuk menghitung rekap rentang tanggal ini (bisa memakan waktu beberapa menit untuk jumlah pegawai sebanyak ini). Tip: pakai "Filter Unit" di atas untuk mempersempit dan mempercepat proses.'
+    ]));
+  }
 }
 
 /* ============ PENGANGKATAN PEGAWAI TETAP ============ */
