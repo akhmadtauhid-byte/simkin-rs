@@ -384,6 +384,28 @@ async function _gasSetRaw(key, value){
   _gasStats.fail++;
   throw new Error('Gagal menyimpan "'+key+'" ke server bersama: '+(lastErr&&lastErr.message||lastErr));
 }
+/** Ambil BANYAK key sekaligus dalam SATU (atau sedikit) permintaan HTTP — dipakai untuk memangkas ratusan
+ * panggilan satu-per-satu (mis. penilaian tiap pegawai per periode) jadi hanya beberapa kali bolak-balik ke
+ * server. `keys` dipecah jadi rombongan kecil supaya URL permintaan (GET) tidak melebihi batas panjang browser. */
+const GAS_MULTI_BATCH_SIZE = 60;
+async function _gasGetMultiRaw(keys){
+  let lastErr = null;
+  for(let attempt=0; attempt<=RETRY_DELAYS_MS.length; attempt++){
+    try{
+      const r = await gasFetch({action:'getMulti', keys: JSON.stringify(keys)}, false, null, 20000);
+      _gasStats.ok++;
+      return r.values || {};
+    }catch(e){
+      lastErr = e;
+      if(attempt < RETRY_DELAYS_MS.length){
+        notifyNetworkStatus('Jaringan lambat, mencoba lagi… (percobaan '+(attempt+2)+'/'+(RETRY_DELAYS_MS.length+1)+')');
+        await new Promise(res=>setTimeout(res, RETRY_DELAYS_MS[attempt]));
+      }
+    }
+  }
+  _gasStats.fail++;
+  throw lastErr;
+}
 async function _gasDeleteRaw(key){
   let lastErr = null;
   for(let attempt=0; attempt<=RETRY_DELAYS_MS.length; attempt++){
@@ -497,6 +519,30 @@ const Storage = {
       }
       return {keys, prefix, shared};
     }catch(e){ return {keys:[]}; }
+  },
+  /** Ambil banyak key SEKALIGUS (bukan satu-per-satu) — pakai ini kalau butuh puluhan/ratusan key terkait
+   * dalam satu layar (mis. data penilaian semua pegawai untuk satu periode). Mengembalikan {key: {key,value,shared}|null}.
+   * CATATAN: tidak mendukung nilai yang terpecah (chunked) seperti Storage.get biasa — cukup aman dipakai untuk
+   * data yang biasanya kecil (mis. satu record penilaian per pegawai), bukan untuk nilai besar seperti foto absen. */
+  async getMulti(keys, shared){
+    const result = {};
+    if(!keys || keys.length===0) return result;
+    if(STORAGE_MODE==='gas'){
+      try{
+        for(let i=0;i<keys.length;i+=GAS_MULTI_BATCH_SIZE){
+          const batch = keys.slice(i, i+GAS_MULTI_BATCH_SIZE);
+          const values = await _gasGetMultiRaw(batch);
+          batch.forEach(k=>{
+            const v = values[k];
+            result[k] = (v!==undefined && v!==null && v!=='') ? {key:k, value:v, shared} : null;
+          });
+        }
+        return result;
+      }catch(e){ /* jatuh ke pengambilan satu-satu di bawah kalau getMulti gagal total, jangan sampai data hilang */ }
+    }
+    // Mode cloud/lokal, atau getMulti gas gagal total: jatuh ke Storage.get satu-satu (tetap benar, cuma tidak secepat itu).
+    await Promise.all(keys.map(async k=>{ try{ result[k] = await Storage.get(k, shared); }catch(e){ result[k]=null; } }));
+    return result;
   }
 };
 
@@ -833,15 +879,19 @@ async function loadPenilaianForPeriode(periode){
     });
 
     if(existingKeys.size>0){
-      // Ambil semua data penilaian periode ini SEKALIGUS (maks 10 bersamaan) — bukan satu per satu.
-      await mapLimit([...existingKeys], 10, async (k)=>{
-        try{
-          const r = await Storage.get(k, true);
-          if(r){
+      // Ambil SEMUA data penilaian periode ini lewat getMulti (segelintir permintaan batch), BUKAN satu
+      // permintaan HTTP terpisah per pegawai — dengan ratusan pegawai, pola lama ini yang paling sering
+      // bikin sistem terasa "macet"/lambat karena harus bolak-balik ke server ratusan kali sekaligus.
+      const keysArr = [...existingKeys];
+      const values = await Storage.getMulti(keysArr, true);
+      keysArr.forEach(k=>{
+        const r = values[k];
+        if(r && r.value){
+          try{
             const pegId = k.split(':').slice(2).join(':');
             state.penilaian[pnKey(periode,pegId)] = JSON.parse(r.value);
-          }
-        }catch(e){}
+          }catch(e){}
+        }
       });
     }
   }catch(e){}
