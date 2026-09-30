@@ -1206,6 +1206,49 @@ async function getAbsensiLog(pegawaiId, dateISO){
 async function saveAbsensiLog(pegawaiId, dateISO, data){
   await Storage.set('absensi-log:'+pegawaiId+':'+dateISO, JSON.stringify(data), true);
 }
+/** Ambil log absensi BANYAK pegawai × BANYAK tanggal sekaligus (lewat Storage.getMulti) — dipakai layar
+ * rekap (Jam Kedatangan, Rekap Rentang Tanggal, Unduh Detail Harian) yang sebelumnya memanggil getAbsensiLog
+ * satu-satu per pegawai per hari (dengan ratusan pegawai × banyak hari, ini bisa jadi ribuan permintaan
+ * terpisah ke server — salah satu penyebab layar terasa "macet" saat dibuka). Hasilnya map key->{...} siap pakai.
+ * PENTING: log yang menyertakan foto selfie sering MELEBIHI batas ukuran sel Sheet dan otomatis "dipecah"
+ * (lihat _gasSetChunked) — Storage.getMulti TIDAK bisa menyatukan potongan itu, jadi key yang ternyata
+ * terpecah diambil ulang lewat jalur normal (getAbsensiLog, yang tahu cara menyatukan potongan) supaya
+ * datanya tetap benar, bukan cuma manifest pecahannya yang salah dibaca sebagai data asli. */
+async function getAbsensiLogsMulti(pegawaiIds, dateISOs){
+  const keys = [];
+  pegawaiIds.forEach(pid=>{ dateISOs.forEach(d=>{ keys.push('absensi-log:'+pid+':'+d); }); });
+  const map = {};
+  if(keys.length===0) return map;
+  const parseKey = (k)=>{ const parts = k.split(':'); return {pid: parts[1], dateISO: parts.slice(2).join(':')}; };
+  try{
+    const values = await Storage.getMulti(keys, true);
+    const chunkedKeys = [];
+    keys.forEach(k=>{
+      const r = values[k];
+      if(!r || !r.value){ map[k] = {}; return; }
+      let parsed = null;
+      try{ parsed = JSON.parse(r.value); }catch(e){ parsed = null; }
+      if(parsed && parsed.__simkinChunked__===true){
+        chunkedKeys.push(k); // manifest pecahan, bukan data asli — perlu diambil ulang lewat jalur yang tahu menyatukan
+      } else {
+        map[k] = parsed || {};
+      }
+    });
+    if(chunkedKeys.length>0){
+      await mapLimit(chunkedKeys, 10, async (k)=>{
+        const {pid, dateISO} = parseKey(k);
+        try{ map[k] = await getAbsensiLog(pid, dateISO); }catch(e){ map[k] = {}; }
+      });
+    }
+  }catch(e){
+    // getMulti gagal total — jatuh ke pengambilan satu-satu penuh (tetap benar, cuma tidak secepat itu)
+    await mapLimit(keys, 10, async (k)=>{
+      const {pid, dateISO} = parseKey(k);
+      try{ map[k] = await getAbsensiLog(pid, dateISO); }catch(e2){ map[k] = {}; }
+    });
+  }
+  return map;
+}
 function isoDateOffset(days){
   const d = new Date(); d.setDate(d.getDate()+days);
   return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
@@ -1325,7 +1368,7 @@ async function scanSuspiciousLogs(pegawaiId, startISO, endISO){
   return results.flat();
 }
 
-async function computeAttendanceSummary(pegawaiId, startISO, endISO){
+async function computeAttendanceSummary(pegawaiId, startISO, endISO, logsMap){
   const start = new Date(startISO), end = new Date(endISO);
   let totalHari=0, hadirHari=0, terlambatHari=0, alphaHari=0, liburHari=0;
   const shiftNamaTerpakai = new Set();
@@ -1336,7 +1379,8 @@ async function computeAttendanceSummary(pegawaiId, startISO, endISO){
     if(shift.libur){ liburHari++; continue; } // hari libur tidak dihitung sebagai hari kerja
     totalHari++;
     shiftNamaTerpakai.add(shift.nama||'Default');
-    const log = await getAbsensiLog(pegawaiId, iso);
+    // Kalau sudah ada peta log hasil pengambilan massal (getAbsensiLogsMulti), pakai itu — jangan minta ke server lagi satu-satu.
+    const log = logsMap ? (logsMap['absensi-log:'+pegawaiId+':'+iso] || {}) : await getAbsensiLog(pegawaiId, iso);
     if(log.masuk){
       hadirHari++;
       const [jamH, menitH] = shift.jamMulai.split(':').map(Number);
@@ -2697,8 +2741,9 @@ async function renderRekapAbsensi(body){
     }
     jamResult.appendChild(el('div',{class:'small-note'},['Memuat…']));
     const dateVal = jamDate.value;
+    const logsMap = await getAbsensiLogsMulti(staffPool.map(p=>p.id), [dateVal]);
     const rows = await mapLimit(staffPool, 15, async (p)=>{
-      const [log, shift] = await Promise.all([getAbsensiLog(p.id, dateVal), getShiftForDate(p.id, dateVal)]);
+      const [log, shift] = await Promise.all([Promise.resolve(logsMap['absensi-log:'+p.id+':'+dateVal] || {}), getShiftForDate(p.id, dateVal)]);
       let statusMasuk = '-';
       if(shift.libur) statusMasuk = 'libur';
       else if(log.masuk){
@@ -2796,8 +2841,17 @@ async function renderRekapAbsensi(body){
     if(staffPool.length>100){
       progressEl.appendChild(el('div',{style:'margin-top:4px;color:var(--gold);'},['Jumlah pegawai cukup banyak — proses ini bisa memakan waktu beberapa menit. Mohon tunggu, jangan tutup/pindah halaman dulu.']));
     }
+    // Ambil semua log absensi rentang tanggal ini untuk SEMUA pegawai SEKALIGUS (batch), bukan satu-satu per pegawai —
+    // ini yang paling banyak memangkas jumlah permintaan ke server untuk rentang tanggal yang panjang.
+    const rangeDates = [];
+    for(let d=new Date(dStart.value); d<=new Date(dEnd.value); d.setDate(d.getDate()+1)){
+      const iso = d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+      if(new Date(iso) > new Date(todayISO())) break;
+      rangeDates.push(iso);
+    }
+    const logsMap = await getAbsensiLogsMulti(staffPool.map(p=>p.id), rangeDates);
     const rows = await mapLimit(staffPool, 15, async (p)=>{
-      const sum = await computeAttendanceSummary(p.id, dStart.value, dEnd.value);
+      const sum = await computeAttendanceSummary(p.id, dStart.value, dEnd.value, logsMap);
       doneCount++;
       if(doneCount % 5 === 0 || doneCount===staffPool.length){
         progressEl.firstChild.textContent = 'Menghitung rekap untuk '+staffPool.length+' pegawai… ('+doneCount+'/'+staffPool.length+')';
@@ -2829,10 +2883,12 @@ async function renderRekapAbsensi(body){
     if(tasks.length>3000 && !confirm('Kombinasi '+staffPool.length+' pegawai × '+dates.length+' hari cukup besar dan bisa memakan waktu beberapa menit. Lanjutkan?')) return;
     detailDlBtn.disabled = true;
     let done = 0;
-    detailDlBtn.textContent = 'Menyiapkan… (0/'+tasks.length+')';
+    detailDlBtn.textContent = 'Mengambil data dari server (batch)…';
     try{
+      const logsMap = await getAbsensiLogsMulti(staffPool.map(p=>p.id), dates);
+      detailDlBtn.textContent = 'Menyiapkan… (0/'+tasks.length+')';
       const allRows = await mapLimit(tasks, 15, async ({p, dateVal})=>{
-        const [log, shift] = await Promise.all([getAbsensiLog(p.id, dateVal), getShiftForDate(p.id, dateVal)]);
+        const [log, shift] = await Promise.all([Promise.resolve(logsMap['absensi-log:'+p.id+':'+dateVal] || {}), getShiftForDate(p.id, dateVal)]);
         let statusMasuk = '-';
         if(shift.libur) statusMasuk = 'libur';
         else if(log.masuk){
