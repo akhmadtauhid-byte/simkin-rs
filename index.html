@@ -272,14 +272,14 @@ const GAS_WEBAPP_URL = 'https://script.google.com/macros/s/AKfycbyrjprz4ytu_mmby
 //    tempel di dua baris di bawah ini. SELAMA DUA BARIS INI MASIH KOSONG, aplikasi tetap memakai
 //    Google Sheets seperti biasa (TIDAK ADA YANG BERUBAH) — jadi aman diisi kapan saja sambil diuji,
 //    dan gampang "dibatalkan" (tinggal kosongkan lagi) kalau ada masalah.
-
+const SUPABASE_URL = 'https://majxuknewgskfignjyxv.supabase.co';
+const SUPABASE_ANON_KEY = 'sb_publishable_aVXL898qXp2IoY06u4w9Fw_GCfPEYbL';   // kunci "anon public" (BUKAN "service_role" — jangan pernah pakai kunci service_role di kode yang dibuka publik)
 
 const LS_PREFIX = 'simkin_rs_';
 const STORAGE_MODE = (SUPABASE_URL && SUPABASE_ANON_KEY) ? 'supabase'
   : GAS_WEBAPP_URL ? 'gas'
   : ((typeof window !== 'undefined' && typeof window.storage !== 'undefined' && window.storage !== null) ? 'cloud' : 'local');
-const SUPABASE_URL = 'https://majxuknewgskfignjyxv.supabase.co';
-const SUPABASE_ANON_KEY = 'sb_publishable_aVXL898qXp2IoYO6u4w9Fw_GCfPEYbL'; // (pakai nilai LENGKAP, bukan yang terpotong)
+
 /* ---- Status jaringan: dipakai layar Absen Mandiri untuk menampilkan pesan "sedang mencoba lagi..."
  * alih-alih layar terasa macet/diam saat koneksi lambat, supaya pengguna tidak buru-buru refresh. ---- */
 let _networkStatusListener = null;
