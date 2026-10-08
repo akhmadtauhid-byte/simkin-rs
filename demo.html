@@ -2491,9 +2491,56 @@ function cutiTahapUntukPeran(r, role){
   return aktif.find(t=>t.key===key) || null;
 }
 function cutiHariEfektif(r){ return (typeof r.jumlahHariFinal==='number') ? r.jumlahHariFinal : (r.jumlahHari||0); }
+/** Rentang tanggal yang BERLAKU: tanggal yang ditetapkan HRD saat validasi (kalau ada), selain itu tanggal yang diajukan. */
+function cutiRentang(r){
+  if(r.tglMulaiFinal && r.tglSelesaiFinal) return {mulai:r.tglMulaiFinal, selesai:r.tglSelesaiFinal, diubah:(r.tglMulaiFinal!==r.tglMulai || r.tglSelesaiFinal!==r.tglSelesai)};
+  return {mulai:r.tglMulai, selesai:r.tglSelesai, diubah:false};
+}
+function cutiFmtRentang(r){ const g = cutiRentang(r); return cutiFmtTgl(g.mulai)+' – '+cutiFmtTgl(g.selesai); }
 function cutiTanggalEfektif(r){
-  const ds = cutiDatesBetween(r.tglMulai, r.tglSelesai);
-  return r.tanpaAkhirPekan ? ds.filter(x=>{ const w=cutiParseISO(x).getDay(); return w!==0 && w!==6; }) : ds;
+  const g = cutiRentang(r);
+  let ds = cutiDatesBetween(g.mulai, g.selesai);
+  if(r.tanpaAkhirPekan) ds = ds.filter(x=>{ const w=cutiParseISO(x).getDay(); return w!==0 && w!==6; });
+  // Data lama (sebelum ada tanggal final): HRD hanya mengubah jumlah hari → berlaku untuk N hari pertama.
+  if(!r.tglMulaiFinal && typeof r.jumlahHariFinal==='number' && r.jumlahHariFinal>0 && r.jumlahHariFinal<ds.length) ds = ds.slice(0, r.jumlahHariFinal);
+  return ds;
+}
+/** Pengajuan lain milik pegawai yang sama (belum ditolak/dibatalkan) yang tanggalnya beririsan dengan rentang ini. */
+function cutiCariBentrok(pegawaiId, mulai, selesai, exceptId){
+  return state.cuti.list.find(r=>{
+    if(r.pegawaiId!==pegawaiId || r.id===exceptId) return false;
+    const st = cutiStatus(r).key;
+    if(st==='ditolak' || st==='dibatalkan') return false;
+    const g = cutiRentang(r);
+    return !(selesai < g.mulai || mulai > g.selesai);
+  }) || null;
+}
+/** Kontrol tanggal yang disetujui HRD (dipakai saat validasi dan saat mengubah cuti yang sudah disetujui). */
+function cutiTanggalFinalForm(r){
+  const g = cutiRentang(r);
+  const dM = el('input',{type:'date', value:g.mulai}), dS = el('input',{type:'date', value:g.selesai});
+  const out = el('b',null,['']);
+  const warn = el('div');
+  const hitung = ()=> (dM.value && dS.value && dS.value>=dM.value) ? cutiHitungHari(dM.value, dS.value, !!r.tanpaAkhirPekan) : 0;
+  const upd = ()=>{
+    const n = hitung();
+    out.textContent = n>0 ? n+' hari'+(r.tanpaAkhirPekan?' (tanpa Sabtu/Minggu)':'') : '—';
+    warn.innerHTML = '';
+    if(n<=0) return;
+    const bt = cutiCariBentrok(r.pegawaiId, dM.value, dS.value, r.id);
+    if(bt) warn.appendChild(el('div',{class:'warn-note',style:'margin-top:6px;'},['⚠️ Bentrok dengan pengajuan lain ('+cutiJenisNama(bt.jenis)+', '+cutiFmtRentang(bt)+', '+cutiStatus(bt).label+').']));
+    const sl = cutiSaldo(r.pegawaiId, r.jenis, dM.value.slice(0,4), r.id);
+    if(sl.jatah!==null && n>sl.sisa) warn.appendChild(el('div',{class:'warn-note',style:'margin-top:6px;'},['⚠️ Melebihi sisa jatah '+r.jenisNama+' ('+sl.sisa+' hari).']));
+  };
+  [dM,dS].forEach(x=>x.addEventListener('change', upd));
+  upd();
+  const node = el('div',{class:'field',style:'margin-bottom:10px;'},[
+    el('label',null,['Tanggal cuti yang disetujui (boleh diubah dari yang diajukan)']),
+    el('div',{style:'display:flex;gap:8px;align-items:center;flex-wrap:wrap;'},[dM, el('span',null,['s.d.']), dS, el('span',null,['=']), out]),
+    el('div',{class:'small-note',style:'margin-top:4px;'},['Diajukan pegawai: '+cutiFmtTgl(r.tglMulai)+' s.d. '+cutiFmtTgl(r.tglSelesai)+' ('+r.jumlahHari+' hari). Tanggal inilah yang tampil di Jadwal Jaga dan dihitung di rekap absensi.']),
+    warn
+  ]);
+  return {node, mulai:()=>dM.value, selesai:()=>dS.value, hari:hitung};
 }
 function cutiRebuildIndex(){
   const idx = {};
@@ -2578,7 +2625,7 @@ function cutiSaldo(pegawaiId, jenisKey, tahun, excludeId){
   let terpakai=0, menunggu=0;
   state.cuti.list.forEach(r=>{
     if(r.pegawaiId!==pegawaiId || r.jenis!==jenisKey || r.id===excludeId) return;
-    if(String(r.tglMulai||'').slice(0,4)!==String(tahun)) return;
+    if(String(cutiRentang(r).mulai||'').slice(0,4)!==String(tahun)) return;
     const st = cutiStatus(r).key;
     if(st==='disetujui') terpakai += cutiHariEfektif(r);
     else if(st.indexOf('menunggu_')===0) menunggu += (r.jumlahHari||0);
@@ -2729,13 +2776,8 @@ async function cutiSubmit(p, f, diajukanOleh){
   const hari = cutiHitungHari(f.tglMulai, f.tglSelesai, !!f.tanpaAkhirPekan);
   if(hari<=0) throw new Error('Rentang tanggal tidak mengandung hari cuti (semua jatuh di akhir pekan?).');
   if(!String(f.alasan||'').trim()) throw new Error('Alasan cuti wajib diisi.');
-  const bentrok = state.cuti.list.find(r=>{
-    if(r.pegawaiId!==p.id) return false;
-    const st = cutiStatus(r).key;
-    if(st==='ditolak' || st==='dibatalkan') return false;
-    return !(f.tglSelesai < r.tglMulai || f.tglMulai > r.tglSelesai);
-  });
-  if(bentrok) throw new Error('Tanggal ini bentrok dengan pengajuan cuti lain ('+cutiJenisNama(bentrok.jenis)+', '+cutiFmtTgl(bentrok.tglMulai)+' s.d. '+cutiFmtTgl(bentrok.tglSelesai)+', status: '+cutiStatus(bentrok).label+').');
+  const bentrok = cutiCariBentrok(p.id, f.tglMulai, f.tglSelesai, null);
+  if(bentrok) throw new Error('Tanggal ini bentrok dengan pengajuan cuti lain ('+cutiJenisNama(bentrok.jenis)+', '+cutiFmtRentang(bentrok).replace(' – ',' s.d. ')+', status: '+cutiStatus(bentrok).label+').');
   const {tahap, inst} = cutiBuatTahap(p);
   const now = new Date();
   const r = {
@@ -2837,7 +2879,8 @@ function cutiBuildDocHtml(r){
     +(r.instalasiNama ? row('Instalasi', cutiEsc(r.instalasiNama)) : '')+'</table>'
     +'<div style="font-weight:700;margin:12px 0 3px;">II. RINCIAN CUTI</div><table>'
     +row('Jenis cuti', '<b>'+cutiEsc(r.jenisNama)+'</b>')
-    +row('Tanggal mulai', cutiEsc(cutiFmtTgl(r.tglMulai)))+row('Tanggal selesai', cutiEsc(cutiFmtTgl(r.tglSelesai)))
+    +row('Tanggal mulai', cutiEsc(cutiFmtTgl(cutiRentang(r).mulai)))+row('Tanggal selesai', cutiEsc(cutiFmtTgl(cutiRentang(r).selesai)))
+    +(cutiRentang(r).diubah ? row('Tanggal yang diajukan semula', cutiEsc(cutiFmtTgl(r.tglMulai)+' s.d. '+cutiFmtTgl(r.tglSelesai))+' (disesuaikan HRD)') : '')
     +row('Lama cuti', '<b>'+hariFinal+' hari</b>'+(hariFinal!==r.jumlahHari ? ' (diajukan '+r.jumlahHari+' hari, disesuaikan HRD)' : '')+(r.tanpaAkhirPekan?' — tidak termasuk Sabtu/Minggu':''))
     +row('Alasan', cutiEsc(r.alasan))+row('Alamat selama cuti', cutiEsc(r.alamat))+row('No. telepon', cutiEsc(r.telp))
     +row('Pelimpahan tugas kepada', cutiEsc(r.pengganti))
@@ -2860,7 +2903,7 @@ function cutiUnduhWord(r){
   const blob = new Blob(['﻿'+html], {type:'application/msword'});
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
-  a.href = url; a.download = 'Formulir-Cuti-'+String(r.nama).replace(/[^\w]+/g,'-')+'-'+r.tglMulai+'.doc';
+  a.href = url; a.download = 'Formulir-Cuti-'+String(r.nama).replace(/[^\w]+/g,'-')+'-'+cutiRentang(r).mulai+'.doc';
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(()=>URL.revokeObjectURL(url), 5000);
 }
@@ -2880,8 +2923,9 @@ function cutiOpenDetail(r, onChanged){
     cutiStatusBadge(r)
   ]));
   box.appendChild(kv('Jenis cuti', r.jenisNama));
-  box.appendChild(kv('Periode', cutiFmtTgl(r.tglMulai)+' s.d. '+cutiFmtTgl(r.tglSelesai)));
+  box.appendChild(kv('Periode', cutiFmtTgl(cutiRentang(r).mulai)+' s.d. '+cutiFmtTgl(cutiRentang(r).selesai)+(cutiRentang(r).diubah?' (diajukan: '+cutiFmtTgl(r.tglMulai)+' s.d. '+cutiFmtTgl(r.tglSelesai)+')':'')));
   box.appendChild(kv('Lama cuti', cutiHariEfektif(r)+' hari'+(cutiHariEfektif(r)!==r.jumlahHari?' (diajukan '+r.jumlahHari+' hari)':'')+(r.tanpaAkhirPekan?' · tanpa Sabtu/Minggu':'')));
+  (r.riwayatUbah||[]).forEach(h=>box.appendChild(kv('Perubahan tanggal', h.dari+' → '+h.ke+' · '+h.oleh+' · '+cutiFmtWaktu(h.waktu))));
   box.appendChild(kv('Alasan', r.alasan));
   box.appendChild(kv('Alamat selama cuti', r.alamat));
   box.appendChild(kv('No. telepon', r.telp));
@@ -2915,6 +2959,9 @@ function cutiOpenDetail(r, onChanged){
       }catch(e){ alert('❌ '+(e.message||e)); }
     }},['⛔ Batalkan Cuti']));
   }
+  if((state.role==='hrd' || state.role==='admin') && st==='disetujui'){
+    btns.appendChild(el('button',{class:'btn btn-gold', onclick:()=>{ bg.remove(); cutiOpenUbahTanggal(r, onChanged); }},['✏️ Ubah Tanggal Disetujui']));
+  }
   if(state.role==='admin'){
     btns.appendChild(el('button',{class:'btn btn-outline', style:'color:var(--red);border-color:var(--red);', onclick: async ()=>{
       if(!confirm('HAPUS PERMANEN pengajuan cuti ini beserta riwayatnya? Tindakan ini tidak bisa dibatalkan.')) return;
@@ -2926,6 +2973,46 @@ function cutiOpenDetail(r, onChanged){
     }},['🗑️ Hapus']));
   }
   box.appendChild(btns);
+}
+
+/** HRD/Admin mengubah tanggal cuti yang SUDAH disetujui (mis. cuti dipotong atau digeser). Jadwal & rekap absensi ikut berubah. */
+function cutiOpenUbahTanggal(r, onDone){
+  if(state.role!=='hrd' && state.role!=='admin'){ alert('Hanya HRD atau Admin yang dapat mengubah tanggal cuti.'); return; }
+  const box = el('div');
+  box.appendChild(el('div',{style:'font-size:12.5px;margin-bottom:10px;'},[el('b',null,[r.nama]), ' — '+r.jenisNama+' · saat ini '+cutiFmtRentang(r)+' ('+cutiHariEfektif(r)+' hari)']));
+  const namaInp = el('input',{type:'text', placeholder:'Nama Anda', value:(function(){ try{ return localStorage.getItem('simkin_demo_cuti_approver_'+state.role)||''; }catch(e){ return ''; } })(), style:'width:100%;'});
+  box.appendChild(el('div',{class:'field',style:'margin-bottom:10px;'},[el('label',null,['Nama Anda (tercatat sebagai pengubah)']), namaInp]));
+  const tf = cutiTanggalFinalForm(r);
+  box.appendChild(tf.node);
+  const msg = el('div'); box.appendChild(msg);
+  const go = el('button',{class:'btn btn-primary',style:'padding:9px 18px;'},['💾 Simpan Perubahan']);
+  box.appendChild(go);
+  const bg = cutiOpenModal('Ubah Tanggal Cuti Disetujui', box);
+  go.addEventListener('click', async ()=>{
+    msg.innerHTML='';
+    const nama = namaInp.value.trim();
+    if(!nama){ msg.appendChild(el('div',{class:'warn-note'},['Isi nama Anda dulu.'])); return; }
+    const m = tf.mulai(), e = tf.selesai();
+    if(!m || !e || e<m){ msg.appendChild(el('div',{class:'warn-note'},['Isi tanggal mulai dan selesai dengan benar.'])); return; }
+    const hari = tf.hari();
+    if(!(hari>0)){ msg.appendChild(el('div',{class:'warn-note'},['Rentang tanggal itu tidak mengandung hari cuti (semua jatuh di akhir pekan?).'])); return; }
+    const bt = cutiCariBentrok(r.pegawaiId, m, e, r.id);
+    if(bt){ msg.appendChild(el('div',{class:'warn-note'},['Tanggal bentrok dengan pengajuan lain ('+cutiJenisNama(bt.jenis)+', '+cutiFmtRentang(bt)+', '+cutiStatus(bt).label+').'])); return; }
+    go.disabled = true; go.textContent = 'Menyimpan…';
+    try{
+      try{ localStorage.setItem('simkin_demo_cuti_approver_'+state.role, nama); }catch(ex){}
+      const oleh = nama + (state.role==='admin' ? ' (Admin)' : '');
+      await cutiUpdate(r.id, x=>{
+        if(x.dibatalkan) return 'Pengajuan ini sudah dibatalkan.';
+        if(cutiStatus(x).key!=='disetujui') return 'Hanya cuti yang sudah disetujui yang dapat diubah tanggalnya.';
+        const lama = cutiFmtRentang(x)+' ('+cutiHariEfektif(x)+' hari)';
+        x.tglMulaiFinal = m; x.tglSelesaiFinal = e; x.jumlahHariFinal = hari;
+        x.riwayatUbah = (x.riwayatUbah||[]).concat([{oleh, waktu:new Date().toISOString(), dari:lama, ke:cutiFmtTgl(m)+' – '+cutiFmtTgl(e)+' ('+hari+' hari)'}]);
+      });
+      bg.remove();
+      if(onDone) await onDone();
+    }catch(ex){ go.disabled=false; go.textContent='💾 Simpan Perubahan'; msg.appendChild(el('div',{class:'warn-note'},['❌ '+(ex.message||ex)])); }
+  });
 }
 
 /* ---------- tindakan pejabat (setuju / tolak) ---------- */
@@ -2942,8 +3029,8 @@ function cutiOpenAction(r, aksi, onDone){
   box.appendChild(el('div',{class:'field',style:'margin-bottom:10px;'},[el('label',null,['Nama Anda (tercatat di dokumen)']), namaInp]));
   let hariInp = null;
   if(t.key==='hrd' && aksi==='setuju'){
-    hariInp = el('input',{type:'number', min:'1', step:'1', value:String(r.jumlahHari), style:'width:120px;'});
-    box.appendChild(el('div',{class:'field',style:'margin-bottom:10px;'},[el('label',null,['Lama cuti yang divalidasi (hari) — boleh disesuaikan']), hariInp]));
+    hariInp = cutiTanggalFinalForm(r);
+    box.appendChild(hariInp.node);
     const sal = cutiSaldo(r.pegawaiId, r.jenis, (r.tglMulai||'').slice(0,4), r.id);
     if(sal.jatah!==null){
       const lebih = sal.sisa < r.jumlahHari;
@@ -2963,7 +3050,15 @@ function cutiOpenAction(r, aksi, onDone){
     if(!nama){ msg.appendChild(el('div',{class:'warn-note'},['Isi nama Anda dulu.'])); return; }
     if(aksi==='tolak' && !catInp.value.trim()){ msg.appendChild(el('div',{class:'warn-note'},['Alasan penolakan wajib diisi.'])); return; }
     let hari = null;
-    if(hariInp){ hari = Number(hariInp.value); if(!(hari>0)){ msg.appendChild(el('div',{class:'warn-note'},['Lama cuti harus lebih dari 0 hari.'])); return; } }
+    let tglM=null, tglS=null;
+    if(hariInp){
+      tglM = hariInp.mulai(); tglS = hariInp.selesai();
+      if(!tglM || !tglS || tglS<tglM){ msg.appendChild(el('div',{class:'warn-note'},['Isi tanggal mulai dan selesai yang disetujui dengan benar.'])); return; }
+      hari = hariInp.hari();
+      if(!(hari>0)){ msg.appendChild(el('div',{class:'warn-note'},['Rentang tanggal itu tidak mengandung hari cuti (semua jatuh di akhir pekan?).'])); return; }
+      const bt = cutiCariBentrok(r.pegawaiId, tglM, tglS, r.id);
+      if(bt){ msg.appendChild(el('div',{class:'warn-note'},['Tanggal bentrok dengan pengajuan lain ('+cutiJenisNama(bt.jenis)+', '+cutiFmtRentang(bt)+', '+cutiStatus(bt).label+').'])); return; }
+    }
     go.disabled = true; go.textContent = 'Menyimpan…';
     try{
       try{ localStorage.setItem('simkin_demo_cuti_approver_'+roleKey, nama); }catch(e){}
@@ -2974,7 +3069,7 @@ function cutiOpenAction(r, aksi, onDone){
         if(!cur || cur.status!=='pending' || !cutiTahapAktif(x).some(a=>a.key===t.key)) return 'Pengajuan ini sudah diproses pihak lain. Muat ulang halaman untuk melihat status terbaru.';
         cur.status = aksi==='tolak' ? 'rejected' : 'approved';
         cur.oleh = oleh; cur.waktu = new Date().toISOString(); cur.catatan = catInp.value.trim();
-        if(hari!==null) x.jumlahHariFinal = hari;
+        if(hari!==null){ x.jumlahHariFinal = hari; x.tglMulaiFinal = tglM; x.tglSelesaiFinal = tglS; }
         // Mode "salah satu": begitu satu atasan menyetujui, atasan satunya tidak perlu lagi (otomatis dilewati).
         if(aksi==='setuju' && x.modeAtasan==='salah_satu' && (t.key==='ruang' || t.key==='instalasi')){
           const lain = x.tahap.find(y=>(y.key==='ruang' || y.key==='instalasi') && y.key!==t.key && y.status==='pending');
@@ -3117,7 +3212,7 @@ async function renderCutiSaya(body){
       }
       table.appendChild(el('tr',null,[
         el('td',null,[cutiFmtTgl((r.dibuatPada||'').slice(0,10))]), el('td',null,[r.jenisNama]),
-        el('td',null,[cutiFmtTgl(r.tglMulai)+' – '+cutiFmtTgl(r.tglSelesai)]), el('td',null,[String(cutiHariEfektif(r))]),
+        el('td',null,[cutiFmtRentang(r)]), el('td',null,[String(cutiHariEfektif(r))]),
         el('td',null,[cutiProgressEl(r)]), el('td',null,[cutiStatusBadge(r)]), aksi
       ]));
     });
@@ -3150,7 +3245,7 @@ async function renderCutiApproval(body){
       table.appendChild(el('tr',null,[
         el('td',null,[el('div',{style:'font-weight:700;'},[r.nama]), el('div',{style:'font-size:10.5px;color:var(--ink-soft);'},[r.jabatan])]),
         el('td',null,[r.unitNama]), el('td',null,[r.jenisNama]),
-        el('td',null,[cutiFmtTgl(r.tglMulai)+' – '+cutiFmtTgl(r.tglSelesai)]), el('td',null,[String(r.jumlahHari)]),
+        el('td',null,[cutiFmtRentang(r)]), el('td',null,[String(r.jumlahHari)]),
         el('td',null,[cutiProgressEl(r)]),
         el('td',{style:'white-space:nowrap;'},[
           el('button',{class:'btn btn-primary btn-sm', onclick:()=>cutiOpenAction(r,'setuju',reload)},[cutiTahapUntukPeran(r,state.role).key==='hrd'?'✓ Validasi':'✓ Setujui']),
@@ -3180,7 +3275,7 @@ async function renderCutiApproval(body){
     rows.forEach(r=>{
       table.appendChild(el('tr',null,[
         el('td',null,[r.nama]), el('td',null,[r.unitNama]), el('td',null,[r.jenisNama]),
-        el('td',null,[cutiFmtTgl(r.tglMulai)+' – '+cutiFmtTgl(r.tglSelesai)]), el('td',null,[String(cutiHariEfektif(r))]),
+        el('td',null,[cutiFmtRentang(r)]), el('td',null,[String(cutiHariEfektif(r))]),
         el('td',null,[cutiStatusBadge(r)]),
         el('td',null,[el('button',{class:'btn btn-outline btn-sm', onclick:()=>cutiOpenDetail(r, reload)},['📄 Detail / Unduh'])])
       ]));
@@ -3243,7 +3338,7 @@ function exportRekapCutiExcel(rowsPegawai, rowsPengajuan, tahun, jenisList){
   const d2 = [['DAFTAR PENGAJUAN CUTI — '+tahun],[],['No. Dokumen','Nama','Unit','Jabatan','Jenis Cuti','Mulai','Selesai','Hari (disetujui)','Status','Kepala Ruang','Kepala Instalasi','HRD','Diajukan','Alasan']];
   rowsPengajuan.forEach(r=>{
     const nm = k=>{ const t=(r.tahap||[]).find(x=>x.key===k); return t ? ((t.status==='approved'?'✓ ':t.status==='rejected'?'✕ ':t.status==='skipped'?'– ':'… ')+(t.oleh||'')) : ''; };
-    d2.push([r.nomor, r.nama, r.unitNama, r.jabatan, r.jenisNama, r.tglMulai, r.tglSelesai, cutiHariEfektif(r), cutiStatus(r).label, nm('ruang'), nm('instalasi'), nm('hrd'), cutiFmtWaktu(r.dibuatPada), r.alasan]);
+    d2.push([r.nomor, r.nama, r.unitNama, r.jabatan, r.jenisNama, cutiRentang(r).mulai, cutiRentang(r).selesai, cutiHariEfektif(r), cutiStatus(r).label, nm('ruang'), nm('instalasi'), nm('hrd'), cutiFmtWaktu(r.dibuatPada), r.alasan]);
   });
   const ws2 = XLSX.utils.aoa_to_sheet(d2);
   ws2['!cols'] = [{wch:18},{wch:24},{wch:16},{wch:18},{wch:20},{wch:11},{wch:11},{wch:12},{wch:22},{wch:22},{wch:22},{wch:22},{wch:20},{wch:36}];
@@ -3262,7 +3357,7 @@ async function renderCutiRekap(body){
   const pool = cutiPegawaiDalamLingkup().filter(p=>!state.cuti.rekapUnit || p.unitId===state.cuti.rekapUnit);
   const q = (state.cuti.rekapSearch||'').trim().toLowerCase();
   const pegs = pool.filter(p=>!q || p.nama.toLowerCase().includes(q)).sort((a,b)=>a.nama.localeCompare(b.nama));
-  const reqTahun = state.cuti.list.filter(r=>cutiDalamLingkup(r) && String(r.tglMulai||'').slice(0,4)===String(tahun));
+  const reqTahun = state.cuti.list.filter(r=>cutiDalamLingkup(r) && String(cutiRentang(r).mulai||'').slice(0,4)===String(tahun));
 
   const top = el('div',{class:'panel'});
   top.appendChild(el('h3',null,['📋 Rekap Cuti per Pegawai — '+tahun]));
@@ -3332,7 +3427,7 @@ async function renderCutiRekap(body){
         });
         mine.forEach(x=>{
           box.appendChild(el('div',{style:'display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--line);flex-wrap:wrap;'},[
-            el('div',null,[el('div',{style:'font-weight:700;font-size:12.5px;'},[x.jenisNama+' · '+cutiHariEfektif(x)+' hari']), el('div',{style:'font-size:11.5px;color:var(--ink-soft);'},[cutiFmtTgl(x.tglMulai)+' – '+cutiFmtTgl(x.tglSelesai)])]),
+            el('div',null,[el('div',{style:'font-weight:700;font-size:12.5px;'},[x.jenisNama+' · '+cutiHariEfektif(x)+' hari']), el('div',{style:'font-size:11.5px;color:var(--ink-soft);'},[cutiFmtRentang(x)])]),
             el('div',{style:'display:flex;gap:6px;align-items:center;'},[cutiStatusBadge(x), el('button',{class:'btn btn-outline btn-sm', onclick:()=>cutiOpenDetail(x, async ()=>{ await ensureCutiLoaded(true); rerender(); })},['📄'])])
           ]));
         });
