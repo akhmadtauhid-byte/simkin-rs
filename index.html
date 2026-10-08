@@ -2425,7 +2425,7 @@ const CUTI_DEFAULT_CONFIG = {
   kotaSurat:'Bumiayu',
 };
 const CUTI_TAHAP_LABEL = {ruang:'Kepala Ruang', instalasi:'Kepala Instalasi', hrd:'HRD'};
-state.cuti = {config:null, list:[], index:{}, loadedAt:0, promise:null, formOpen:false, form:null, filterStatus:'', tahun:String(new Date().getFullYear()), rekapSearch:'', rekapUnit:''};
+state.cuti = {config:null, list:[], index:{}, adj:{}, loadedAt:0, promise:null, formOpen:false, form:null, filterStatus:'', tahun:String(new Date().getFullYear()), rekapSearch:'', rekapUnit:''};
 state.currentInstalasiId = null;
 state.instalasiAuth = {};
 state.instalasiLoginError = null;
@@ -2527,6 +2527,17 @@ async function ensureCutiLoaded(force){
           try{ const r = JSON.parse(v.value); if(r && r.id && r.pegawaiId) list.push(r); }catch(e){}
         });
       }
+      // Penyesuaian saldo (cuti yang sudah terpakai sebelum sistem dipakai) — satu key per tahun: "cuti-saldo:{tahun}"
+      try{
+        const sl = await Storage.list('cuti-saldo:', true);
+        const sk = (sl && sl.keys) ? sl.keys.filter(k=>k.indexOf('cuti-saldo:')===0) : [];
+        const adj = {};
+        if(sk.length){
+          const sv = await Storage.getMulti(sk, true);
+          sk.forEach(k=>{ const v = sv[k]; if(!v || !v.value) return; try{ adj[k.slice('cuti-saldo:'.length)] = JSON.parse(v.value) || {}; }catch(e){} });
+        }
+        c.adj = adj;
+      }catch(e){ if(!c.adj) c.adj = {}; }
       list.sort((a,b)=> String(b.dibuatPada||'').localeCompare(String(a.dibuatPada||'')));
       c.list = list;
       cutiRebuildIndex();
@@ -2555,6 +2566,12 @@ async function cutiSaveConfig(){
   await Storage.set('cuti-config', JSON.stringify(cutiConfig()), true);
 }
 
+/** Hari cuti yang sudah terpakai DI LUAR sistem (sebelum SIMKIN dipakai) atau penyesuaian HRD, per pegawai/jenis/tahun. */
+function cutiLuar(pegawaiId, jenisKey, tahun){
+  const a = (state.cuti.adj||{})[String(tahun)];
+  const x = a && a[pegawaiId] && a[pegawaiId][jenisKey];
+  return (x && typeof x.luar==='number' && !isNaN(x.luar)) ? x.luar : 0;
+}
 function cutiSaldo(pegawaiId, jenisKey, tahun, excludeId){
   const j = (cutiConfig().jenis||[]).find(x=>x.key===jenisKey);
   const jatah = (j && typeof j.jatah==='number') ? j.jatah : null;
@@ -2566,7 +2583,127 @@ function cutiSaldo(pegawaiId, jenisKey, tahun, excludeId){
     if(st==='disetujui') terpakai += cutiHariEfektif(r);
     else if(st.indexOf('menunggu_')===0) menunggu += (r.jumlahHari||0);
   });
-  return {jatah, terpakai, menunggu, sisa: jatah===null ? null : jatah-terpakai};
+  const luar = cutiLuar(pegawaiId, jenisKey, tahun);
+  terpakai += luar;
+  return {jatah, terpakai, menunggu, luar, sisa: jatah===null ? null : jatah-terpakai};
+}
+/** Simpan penyesuaian saldo. Membaca versi terbaru dari server dulu lalu menggabungkan hanya baris yang berubah. */
+async function cutiSimpanSaldoLuar(tahun, changes, oleh){
+  const key = 'cuti-saldo:'+tahun;
+  let cur = {};
+  const got = await Storage.get(key, true);
+  if(got && got.value){ try{ cur = JSON.parse(got.value) || {}; }catch(e){ cur = {}; } }
+  const now = new Date().toISOString();
+  changes.forEach(c=>{
+    if(!cur[c.pegawaiId]) cur[c.pegawaiId] = {};
+    if(!c.luar) delete cur[c.pegawaiId][c.jenisKey];
+    else cur[c.pegawaiId][c.jenisKey] = {luar:c.luar, oleh:oleh, waktu:now};
+    if(!Object.keys(cur[c.pegawaiId]).length) delete cur[c.pegawaiId];
+  });
+  await Storage.set(key, JSON.stringify(cur), true);
+  state.cuti.adj[String(tahun)] = cur;
+}
+/** Jendela "Atur Sisa Cuti": HRD/Admin mengisi sisa cuti tiap pegawai saat ini (untuk pegawai yang sudah mengambil cuti sebelum sistem dipakai). */
+function cutiOpenAturSisa(pegs, tahun, onDone){
+  if(state.role!=='hrd' && state.role!=='admin'){ alert('Hanya HRD atau Admin yang dapat mengatur sisa cuti.'); return; }
+  const cfg = cutiConfig();
+  const jList = cfg.jenis.filter(j=>j.jatah!==null);
+  if(!jList.length){ alert('Belum ada jenis cuti yang memiliki jatah. Atur dulu di Pengaturan Cuti.'); return; }
+  let jk = (jList.find(j=>j.key==='tahunan') || jList[0]).key;
+  const box = el('div');
+  const bg = cutiOpenModal('Atur Sisa Cuti — '+tahun, box, true);
+  let inputs = {};
+  const norm = t=>String(t==null?'':t).toLowerCase().replace(/\s+/g,' ').trim();
+  function draw(){
+    box.innerHTML = '';
+    inputs = {};
+    const j = jList.find(x=>x.key===jk);
+    const info = pegs.map(p=>{ const sl = cutiSaldo(p.id, jk, tahun); return {p, jatah:sl.jatah, sistem: sl.terpakai - sl.luar, sisa: sl.sisa}; });
+    box.appendChild(el('div',{class:'small-note',style:'margin-bottom:10px;'},['Isi kolom "Sisa cuti" dengan sisa cuti pegawai SAAT INI (sudah dikurangi cuti yang diambil sebelum sistem dipakai). Cuti yang disetujui lewat SIMKIN sesudahnya akan mengurangi sisa ini otomatis. Perubahan baru tersimpan setelah menekan "Simpan".']));
+    const bar = el('div',{style:'display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px;'});
+    const sel = el('select');
+    jList.forEach(x=>{ const o=el('option',{value:x.key},[x.nama+' (jatah '+x.jatah+' hari)']); if(x.key===jk) o.selected=true; sel.appendChild(o); });
+    sel.addEventListener('change', ()=>{ jk = sel.value; draw(); });
+    bar.appendChild(sel);
+    bar.appendChild(el('button',{class:'btn btn-outline btn-sm', onclick:()=>{ info.forEach(x=>{ inputs[x.p.id].value = String(x.jatah - x.sistem); }); }},['Isi penuh semua']));
+    bar.appendChild(el('button',{class:'btn btn-outline btn-sm', onclick:()=>{
+      const d = [['Nama','Unit','Jatah '+j.nama,'Sisa Cuti '+j.nama+' (isi)']];
+      info.forEach(x=>d.push([x.p.nama, unitName(x.p.unitId), x.jatah, Number(inputs[x.p.id].value===''?x.sisa:inputs[x.p.id].value)]));
+      const ws = XLSX.utils.aoa_to_sheet(d); ws['!cols']=[{wch:28},{wch:20},{wch:14},{wch:22}];
+      const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'Sisa Cuti');
+      XLSX.writeFile(wb, 'Template-Sisa-Cuti-'+jk+'-'+tahun+'.xlsx');
+    }},['💾 Unduh template Excel']));
+    const msg = el('div',{style:'margin-bottom:8px;'});
+    const fileInp = el('input',{type:'file', accept:'.xlsx,.xls,.csv', style:'display:none;'});
+    fileInp.addEventListener('change', ()=>{
+      const f = fileInp.files && fileInp.files[0]; if(!f) return;
+      const rd = new FileReader();
+      rd.onload = ev=>{
+        try{
+          const wb = XLSX.read(new Uint8Array(ev.target.result), {type:'array'});
+          const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], {defval:''});
+          if(!rows.length) throw new Error('File kosong.');
+          const keys = Object.keys(rows[0]);
+          const kNama = keys.find(k=>/^nama/i.test(k)), kSisa = keys.find(k=>/^sisa/i.test(k)), kUnit = keys.find(k=>/^unit/i.test(k));
+          if(!kNama || !kSisa) throw new Error('Kolom "Nama" dan "Sisa …" tidak ditemukan. Pakai template dari tombol di samping.');
+          let cocok=0; const hilang=[];
+          rows.forEach(rw=>{
+            const nm = norm(rw[kNama]); if(!nm) return;
+            let cand = info.filter(x=>norm(x.p.nama)===nm);
+            if(cand.length>1 && kUnit) cand = cand.filter(x=>norm(unitName(x.p.unitId))===norm(rw[kUnit]));
+            const v = rw[kSisa];
+            if(cand.length!==1 || v==='' || isNaN(Number(v))){ hilang.push(String(rw[kNama])); return; }
+            inputs[cand[0].p.id].value = String(Number(v)); inputs[cand[0].p.id].style.background='#FFF8DC'; cocok++;
+          });
+          msg.innerHTML=''; msg.appendChild(el('div',{class:hilang.length?'warn-note':'small-note'},['Terbaca '+cocok+' baris cocok'+(hilang.length?'; '+hilang.length+' baris dilewati karena nama tidak ditemukan, ganda, atau nilainya bukan angka ('+hilang.slice(0,6).join(', ')+(hilang.length>6?', …':'')+').':'.')+' Periksa isiannya (yang berwarna kuning), lalu tekan Simpan.']));
+        }catch(e){ msg.innerHTML=''; msg.appendChild(el('div',{class:'warn-note'},['❌ '+(e.message||e)])); }
+        fileInp.value='';
+      };
+      rd.readAsArrayBuffer(f);
+    });
+    bar.appendChild(el('button',{class:'btn btn-outline btn-sm', onclick:()=>fileInp.click()},['📥 Impor dari Excel']));
+    bar.appendChild(fileInp);
+    box.appendChild(bar);
+    box.appendChild(msg);
+
+    const table = el('table');
+    table.appendChild(el('tr',null,[el('th',null,['Nama']), el('th',null,['Unit']), el('th',null,['Jatah']), el('th',null,['Terpakai di SIMKIN']), el('th',null,['Sisa cuti'])]));
+    info.forEach(x=>{
+      const inp = el('input',{type:'number', min:'0', step:'0.5', value:String(x.sisa), style:'width:84px;'});
+      inputs[x.p.id] = inp;
+      table.appendChild(el('tr',null,[el('td',null,[x.p.nama]), el('td',null,[unitName(x.p.unitId)]), el('td',null,[String(x.jatah)]), el('td',null,[String(x.sistem)]), el('td',null,[inp])]));
+    });
+    box.appendChild(el('div',{style:'max-height:52vh;overflow:auto;border:1px solid var(--line);border-radius:8px;'},[table]));
+
+    const errBox = el('div');
+    const save = el('button',{class:'btn btn-gold',style:'margin-top:12px;padding:10px 22px;'},['💾 Simpan Sisa Cuti']);
+    save.addEventListener('click', async ()=>{
+      errBox.innerHTML='';
+      const changes=[]; let bad=null; let lebih=0;
+      info.forEach(x=>{
+        const v = inputs[x.p.id].value.trim(); if(v==='') return;
+        const n = Number(v);
+        if(isNaN(n) || n<0){ bad = bad || x.p.nama; return; }
+        if(n===x.sisa) return;
+        if(n>x.jatah) lebih++;
+        changes.push({pegawaiId:x.p.id, jenisKey:jk, luar: Math.round((x.jatah - x.sistem - n)*100)/100});
+      });
+      if(bad){ errBox.appendChild(el('div',{class:'warn-note',style:'margin-top:8px;'},['❌ Sisa cuti '+bad+' tidak valid (harus angka 0 atau lebih).'])); return; }
+      if(!changes.length){ errBox.appendChild(el('div',{class:'small-note',style:'margin-top:8px;'},['Tidak ada perubahan untuk disimpan.'])); return; }
+      if(lebih && !confirm(lebih+' pegawai diisi melebihi jatah ('+j.jatah+' hari). Tetap simpan?')) return;
+      save.disabled = true; save.textContent = 'Menyimpan…';
+      try{
+        const oleh = (localStorage.getItem('simkin_cuti_approver_'+state.role)||'') || (state.role==='admin'?'Admin':'HRD');
+        await cutiSimpanSaldoLuar(tahun, changes, oleh);
+        bg.remove();
+        alert('Sisa cuti '+changes.length+' pegawai tersimpan.');
+        if(onDone) onDone();
+      }catch(e){ save.disabled=false; save.textContent='💾 Simpan Sisa Cuti'; errBox.appendChild(el('div',{class:'warn-note',style:'margin-top:8px;'},['❌ Gagal menyimpan: '+(e.message||e)])); }
+    });
+    box.appendChild(save);
+    box.appendChild(errBox);
+  }
+  draw();
 }
 
 /* ---------- pembuatan pengajuan ---------- */
@@ -3129,7 +3266,7 @@ async function renderCutiRekap(body){
 
   const top = el('div',{class:'panel'});
   top.appendChild(el('h3',null,['📋 Rekap Cuti per Pegawai — '+tahun]));
-  top.appendChild(el('div',{class:'small-note',style:'margin-bottom:12px;'},['Hanya cuti yang sudah divalidasi HRD yang dihitung sebagai "terpakai". Pengajuan yang masih berjalan tampil terpisah di kolom "Menunggu". Cuti dihitung menurut tahun tanggal mulainya.']));
+  top.appendChild(el('div',{class:'small-note',style:'margin-bottom:12px;'},['Hanya cuti yang sudah divalidasi HRD yang dihitung sebagai "terpakai", ditambah cuti yang sudah diambil sebelum sistem dipakai (diatur HRD lewat tombol "Atur Sisa Cuti"). Pengajuan yang masih berjalan tampil terpisah di kolom "Menunggu". Cuti dihitung menurut tahun tanggal mulainya.']));
   const bar = el('div',{style:'display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px;'});
   const yrSel = el('select');
   const thisY = new Date().getFullYear();
@@ -3149,7 +3286,7 @@ async function renderCutiRekap(body){
 
   const rowsPegawai = pegs.map(p=>{
     const mine = reqTahun.filter(r=>r.pegawaiId===p.id);
-    const perJenis = cfg.jenis.map(j=>mine.filter(r=>r.jenis===j.key && cutiStatus(r).key==='disetujui').reduce((a,r)=>a+cutiHariEfektif(r),0));
+    const perJenis = cfg.jenis.map(j=>mine.filter(r=>r.jenis===j.key && cutiStatus(r).key==='disetujui').reduce((a,r)=>a+cutiHariEfektif(r),0) + cutiLuar(p.id, j.key, tahun));
     const total = perJenis.reduce((a,b)=>a+b,0);
     const tahunanJ = cfg.jenis.find(j=>j.key==='tahunan');
     let sisa = '-';
@@ -3160,6 +3297,11 @@ async function renderCutiRekap(body){
   const dl = el('button',{class:'btn btn-outline btn-sm'},['💾 Unduh Rekap (Excel)']);
   dl.addEventListener('click', ()=>exportRekapCutiExcel(rowsPegawai, reqTahun, tahun, cfg.jenis));
   bar.appendChild(dl);
+  if(state.role==='hrd' || state.role==='admin'){
+    const aturBtn = el('button',{class:'btn btn-gold btn-sm'},['✏️ Atur Sisa Cuti']);
+    aturBtn.addEventListener('click', ()=>cutiOpenAturSisa(pegs, tahun, async ()=>{ await ensureCutiLoaded(true); rerender(); }));
+    bar.appendChild(aturBtn);
+  }
   top.appendChild(bar);
 
   if(rowsPegawai.length===0){ top.appendChild(el('div',{class:'empty'},['Tidak ada pegawai pada pilihan ini.'])); }
@@ -3173,11 +3315,21 @@ async function renderCutiRekap(body){
       const tds = [el('td',null,[r.p.nama]), el('td',null,[unitName(r.p.unitId)])];
       r.perJenis.forEach(v=>tds.push(el('td',null,[v?String(v):'–'])));
       tds.push(el('td',{style:'font-weight:700;'},[String(r.total)]));
-      tds.push(el('td',null,[String(r.sisa)])); tds.push(el('td',null,[r.menunggu?String(r.menunggu):'–']));
+      const sisaTd = el('td',null,[String(r.sisa)]);
+      if((state.role==='hrd' || state.role==='admin') && r.sisa!=='-'){
+        sisaTd.appendChild(el('button',{class:'btn btn-outline btn-sm', style:'margin-left:6px;padding:1px 6px;', title:'Ubah sisa cuti pegawai ini', onclick:()=>cutiOpenAturSisa([r.p], tahun, async ()=>{ await ensureCutiLoaded(true); rerender(); })},['✏️']));
+      }
+      tds.push(sisaTd); tds.push(el('td',null,[r.menunggu?String(r.menunggu):'–']));
       tds.push(el('td',null,[el('button',{class:'btn btn-outline btn-sm', onclick:()=>{
         const mine = reqTahun.filter(x=>x.pegawaiId===r.p.id);
         const box = el('div');
         if(mine.length===0) box.appendChild(el('div',{class:'empty'},['Tidak ada pengajuan cuti pada '+tahun+'.']));
+        cfg.jenis.forEach(j=>{
+          const l = cutiLuar(r.p.id, j.key, tahun);
+          if(!l) return;
+          const inf = ((state.cuti.adj||{})[String(tahun)]||{})[r.p.id][j.key] || {};
+          box.appendChild(el('div',{class:'small-note',style:'margin-bottom:6px;'},['✏️ Penyesuaian HRD — '+j.nama+': '+l+' hari dihitung terpakai sebelum sistem'+(inf.oleh?' (diatur '+inf.oleh+', '+cutiFmtWaktu(inf.waktu)+')':'')+'.']));
+        });
         mine.forEach(x=>{
           box.appendChild(el('div',{style:'display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--line);flex-wrap:wrap;'},[
             el('div',null,[el('div',{style:'font-weight:700;font-size:12.5px;'},[x.jenisNama+' · '+cutiHariEfektif(x)+' hari']), el('div',{style:'font-size:11.5px;color:var(--ink-soft);'},[cutiFmtTgl(x.tglMulai)+' – '+cutiFmtTgl(x.tglSelesai)])]),
@@ -4452,6 +4604,107 @@ async function buildPengangkatanModal(modal, pegawaiId){
   modal.appendChild(decisionRow);
 }
 
+
+/* ---------- Jadwal Jaga: unduh Excel & cetak (untuk pengecekan) ---------- */
+function jadwalBulanLabel(ym){ const [y,m]=ym.split('-').map(Number); return new Date(y,m-1,1).toLocaleDateString('id-ID',{month:'long',year:'numeric'}); }
+/** Susun matriks pegawai × tanggal dari roster yang sedang tampil (termasuk perubahan yang belum disimpan). */
+function jadwalMatrix(ym, staff, roster){
+  const [yy,mm] = ym.split('-').map(Number);
+  const n = new Date(yy,mm,0).getDate();
+  const pend = {};
+  (state.cuti.list||[]).forEach(r=>{ if(cutiStatus(r).key.indexOf('menunggu_')!==0) return; cutiTanggalEfektif(r).forEach(dt=>{ pend[r.pegawaiId+'|'+dt]=true; }); });
+  const defs = state.shiftDefs;
+  const nmHari = ['Min','Sen','Sel','Rab','Kam','Jum','Sab'];
+  const days = [];
+  for(let d=1; d<=n; d++){ const dow=new Date(yy,mm-1,d).getDay(); days.push({d, weekend:dow===0||dow===6, hari:nmHari[dow]}); }
+  const rows = staff.map(p=>{
+    const rp = roster[p.id] || {};
+    const cnt = {libur:0, cuti:0, kosong:0};
+    defs.forEach(s=>{ cnt[s.key]=0; });
+    const dflt = getShiftForPegawai(p.id);
+    const dLabel = '('+((dflt && dflt.nama) ? String(dflt.nama).slice(0,3) : '-')+')';
+    const cells = days.map(({d})=>{
+      const iso = ym+'-'+String(d).padStart(2,'0');
+      const c = cutiLookup(p.id, iso);
+      if(c){ cnt.cuti++; return {kind:'cuti', label:'Cuti', title:c.jenisNama||'Cuti'}; }
+      const code = rp[d] || '';
+      const tunda = !!pend[p.id+'|'+iso];
+      let cell;
+      if(code==='libur'){ cnt.libur++; cell = {kind:'libur', label:'Lbr'}; }
+      else {
+        const def = code ? defs.find(s=>s.key===code) : null;
+        if(def){ cnt[def.key]++; cell = {kind:'shift', label:String(def.nama).slice(0,3)}; }
+        else { cnt.kosong++; cell = {kind:'default', label:dLabel}; }
+      }
+      cell.tunda = tunda;
+      return cell;
+    });
+    return {p, cells, cnt};
+  });
+  return {days, rows, defs};
+}
+function jadwalUnduhExcel(unitId, ym, staff, roster){
+  const m = jadwalMatrix(ym, staff, roster);
+  const lbl = jadwalBulanLabel(ym);
+  const head = ['No','Nama','Jabatan'].concat(m.days.map(x=>String(x.d))).concat(m.defs.map(s=>s.nama)).concat(['Libur','Cuti','Default (kosong)']);
+  const head2 = ['','',''].concat(m.days.map(x=>x.hari)).concat(m.defs.map(()=>'')).concat(['','','']);
+  const data = [['JADWAL JAGA — RSU ALLAM MEDICA'],['Unit: '+unitName(unitId)],['Bulan: '+lbl],['Diunduh: '+new Date().toLocaleString('id-ID')],[],head,head2];
+  m.rows.forEach((r,i)=>{
+    data.push([i+1, r.p.nama, r.p.jabatan||'-'].concat(r.cells.map(c=>c.label+(c.tunda?'*':''))).concat(m.defs.map(s=>r.cnt[s.key])).concat([r.cnt.libur, r.cnt.cuti, r.cnt.kosong]));
+  });
+  data.push([]);
+  data.push(['Keterangan:']);
+  m.defs.forEach(s=>data.push([String(s.nama).slice(0,3)+' = '+s.nama+' ('+s.jamMulai+'–'+s.jamSelesai+')']));
+  data.push(['Lbr = Libur · Cuti = cuti yang sudah disetujui · (xxx) = kosong, memakai shift default pegawai · * = cuti diajukan, belum disetujui']);
+  const ws = XLSX.utils.aoa_to_sheet(data);
+  ws['!cols'] = [{wch:5},{wch:28},{wch:20}].concat(m.days.map(()=>({wch:5}))).concat(m.defs.map(()=>({wch:8}))).concat([{wch:7},{wch:7},{wch:16}]);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Jadwal Jaga');
+  XLSX.writeFile(wb, 'Jadwal-Jaga-'+unitName(unitId).replace(/[^A-Za-z0-9]+/g,'-')+'-'+ym+'.xlsx');
+}
+function jadwalBuildPrintHtml(unitId, ym, staff, roster){
+  const m = jadwalMatrix(ym, staff, roster);
+  const lbl = jadwalBulanLabel(ym);
+  const E = cutiEsc;
+  const stl = {cuti:'background:#dfe8fb;color:#1f4a8f;font-weight:700;', libur:'background:#fbe3e3;color:#a02525;', shift:'', default:'color:#888;'};
+  let h = '<!doctype html><html><head><meta charset="utf-8"><title>Jadwal Jaga '+E(unitName(unitId))+' '+E(lbl)+'</title><style>'
+    +'@page{size:A4 landscape;margin:9mm;}'
+    +'*{-webkit-print-color-adjust:exact;print-color-adjust:exact;}'
+    +'body{font-family:Arial,Helvetica,sans-serif;color:#111;font-size:9px;margin:0;}'
+    +'h1{font-size:14px;margin:0;text-align:center;letter-spacing:.5px;} h2{font-size:11px;margin:2px 0 8px;text-align:center;font-weight:600;}'
+    +'table{border-collapse:collapse;width:100%;table-layout:fixed;}'
+    +'th,td{border:1px solid #777;text-align:center;padding:2px 0;overflow:hidden;white-space:nowrap;}'
+    +'th{background:#e9eef2;font-size:8px;} td.nm{text-align:left;padding:2px 4px;white-space:nowrap;text-overflow:ellipsis;}'
+    +'td.we,th.we{background:#fdeeee;} .tunda{outline:1.5px solid #e0a000;outline-offset:-2px;}'
+    +'.leg{margin-top:8px;font-size:8.5px;line-height:1.5;} .sig{display:flex;justify-content:space-between;margin-top:18px;font-size:10px;} .sig div{width:30%;text-align:center;} .sig .sp{height:46px;}'
+    +'tr{page-break-inside:avoid;} thead{display:table-header-group;}'
+    +'</style></head><body>';
+  h += '<h1>JADWAL JAGA — RSU ALLAM MEDICA</h1><h2>Unit '+E(unitName(unitId))+' · '+E(lbl)+'</h2>';
+  h += '<table><colgroup><col style="width:3%;"><col style="width:15%;">'+m.days.map(()=>'<col>').join('')+m.defs.map(()=>'<col style="width:2.6%;">').join('')+'<col style="width:2.6%;"><col style="width:2.6%;"></colgroup>';
+  h += '<thead><tr><th rowspan="2">No</th><th rowspan="2">Nama</th>'+m.days.map(x=>'<th class="'+(x.weekend?'we':'')+'">'+x.d+'</th>').join('')+m.defs.map(s=>'<th rowspan="2">'+E(String(s.nama).slice(0,3))+'</th>').join('')+'<th rowspan="2">Lbr</th><th rowspan="2">Cuti</th></tr>';
+  h += '<tr>'+m.days.map(x=>'<th class="'+(x.weekend?'we':'')+'" style="font-weight:400;font-size:7px;">'+x.hari+'</th>').join('')+'</tr></thead><tbody>';
+  m.rows.forEach((r,i)=>{
+    h += '<tr><td>'+(i+1)+'</td><td class="nm">'+E(r.p.nama)+'</td>';
+    r.cells.forEach((c,k)=>{
+      const we = m.days[k].weekend;
+      h += '<td class="'+(c.tunda?'tunda':'')+'" style="'+(c.kind==='shift' && we ? 'background:#fdeeee;' : '')+stl[c.kind]+'">'+E(c.label)+(c.tunda?'*':'')+'</td>';
+    });
+    h += m.defs.map(s=>'<td>'+r.cnt[s.key]+'</td>').join('')+'<td>'+r.cnt.libur+'</td><td>'+r.cnt.cuti+'</td></tr>';
+  });
+  h += '</tbody></table>';
+  h += '<div class="leg"><b>Keterangan:</b> '+m.defs.map(s=>E(String(s.nama).slice(0,3))+' = '+E(s.nama)+' ('+E(s.jamMulai)+'–'+E(s.jamSelesai)+')').join(' · ')+' · Lbr = Libur · <span style="background:#dfe8fb;color:#1f4a8f;font-weight:700;padding:0 3px;">Cuti</span> = cuti disetujui · (xxx) = kolom kosong, memakai shift default pegawai · * = cuti diajukan, belum disetujui. Kolom ringkasan menghitung shift yang ditetapkan pada jadwal; hari berstatus default tidak dihitung.</div>';
+  h += '<div class="sig"><div>Dibuat oleh,<div class="sp"></div>(Kepala Unit / Ruang)</div><div>Diperiksa,<div class="sp"></div>(Kepala Instalasi / Bidang)</div><div>Diketahui,<div class="sp"></div>(HRD)</div></div>';
+  h += '<div style="margin-top:6px;font-size:8px;color:#777;">Dicetak: '+E(new Date().toLocaleString('id-ID'))+'</div>';
+  h += '</body></html>';
+  return h;
+}
+function jadwalCetak(unitId, ym, staff, roster){
+  const w = window.open('', '_blank');
+  if(!w){ alert('Pop-up diblokir browser. Izinkan pop-up untuk situs ini, atau pakai tombol "Unduh Excel".'); return; }
+  w.document.open(); w.document.write(jadwalBuildPrintHtml(unitId, ym, staff, roster)); w.document.close();
+  setTimeout(()=>{ try{ w.focus(); w.print(); }catch(e){} }, 400);
+}
+
 async function renderJadwalJaga(body){
   if(state.units.length===0 || !state.currentUnitId){
     body.appendChild(el('div',{class:'panel'},[el('div',{class:'empty'},['Pilih unit terlebih dahulu di sidebar.'])]));
@@ -4533,6 +4786,13 @@ async function renderJadwalJaga(body){
   });
   scrollWrap.appendChild(table);
   panel.appendChild(scrollWrap);
+
+  const unduhBtn = el('button',{class:'btn btn-outline btn-sm'},['💾 Unduh Excel']);
+  unduhBtn.addEventListener('click', ()=>{ try{ jadwalUnduhExcel(state.currentUnitId, ym, myStaff, roster); }catch(e){ alert('Gagal membuat file: '+(e.message||e)); } });
+  const cetakBtn = el('button',{class:'btn btn-outline btn-sm'},['🖨️ Cetak / PDF']);
+  cetakBtn.addEventListener('click', ()=>jadwalCetak(state.currentUnitId, ym, myStaff, roster));
+  head.appendChild(el('div',{style:'display:flex;gap:8px;flex-wrap:wrap;'},[unduhBtn, cetakBtn]));
+  panel.appendChild(el('div',{class:'small-note',style:'margin-top:8px;'},['Unduh/Cetak memakai tampilan jadwal saat ini, termasuk perubahan yang belum disimpan, jadi bisa dipakai untuk memeriksa jadwal sebelum menekan "Simpan Jadwal". Di jendela cetak pilih "Simpan sebagai PDF" bila ingin berkas PDF.']));
 
   const saveBtn = el('button',{class:'btn btn-gold',style:'margin-top:14px;', onclick: async ()=>{
     saveBtn.disabled = true; saveBtn.textContent='Menyimpan…';
