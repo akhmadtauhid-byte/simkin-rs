@@ -1364,7 +1364,55 @@ function distanceMeters(lat1,lng1,lat2,lng2){
   const a=Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLng/2)**2;
   return R*2*Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
 }
-function todayISO(){ const d=new Date(); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
+/* ============ WAKTU SERVER (anti-manipulasi jam HP) ============
+ * Dulu jam & tanggal absen diambil dari jam HP pegawai — kalau jam HP diubah, jam absen ikut berubah (bisa dipakai
+ * menyembunyikan keterlambatan). Sekarang acuannya jam SERVER Supabase (fungsi server_now), dihitung sebagai selisih
+ * (offset) terhadap jam HP lalu dijaga dengan penghitung monoton performance.now() yang TIDAK terpengaruh kalau jam HP
+ * diubah di tengah jalan. Server juga menetapkan ulang jam absen saat menyimpan (fungsi absen_submit). Kalau server
+ * waktu tidak terjangkau/belum dipasang, jam HP tetap dipakai TAPI absen diberi tanda "belum terverifikasi". */
+const ZONA_RS = 'Asia/Jakarta';        // zona waktu RS (WIB). Ubah ke 'Asia/Makassar' (WITA) / 'Asia/Jayapura' (WIT) bila perlu
+const BATAS_SELISIH_JAM_MENIT = 3;     // selisih jam HP vs server di atas ini ditandai ⚠️ di rekap HRD
+const Waktu = { verified:false, serverMsAtSync:0, perfAtSync:0, syncedAtPerf:-1e9, source:'', rpcMissing:false };
+function trustedNowMs(){ return Waktu.verified ? Waktu.serverMsAtSync + (performance.now()-Waktu.perfAtSync) : Date.now(); }
+function fmtWaktuRS(ms){
+  try{
+    const parts = new Intl.DateTimeFormat('sv-SE',{timeZone:ZONA_RS, year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).format(new Date(ms));
+    return { date: parts.slice(0,10), time: parts.slice(11,16) };
+  }catch(e){
+    const d = new Date(ms);
+    return { date: d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'), time: d.toTimeString().slice(0,5) };
+  }
+}
+/** Sinkronkan jam dengan server. maxAgeMs: kalau sinkron terakhir masih lebih baru dari ini, tidak diulang. */
+async function syncWaktuServer(maxAgeMs){
+  if(STORAGE_MODE!=='supabase') return false;
+  if(maxAgeMs && Waktu.verified && (performance.now()-Waktu.syncedAtPerf) < maxAgeMs) return true;
+  const t0 = performance.now();
+  try{
+    const r = await supabaseFetchRaw('/rest/v1/rpc/server_now', {method:'POST', headers: supabaseHeaders({'Content-Type':'application/json',Accept:'application/json'}), body:'{}'}, 6000);
+    const t1 = performance.now();
+    const ms = Date.parse(r);
+    if(isNaN(ms)) throw new Error('format waktu server tidak dikenali');
+    Waktu.serverMsAtSync = ms + (t1-t0)/2; Waktu.perfAtSync = t1; Waktu.syncedAtPerf = t1; Waktu.verified = true; Waktu.source = 'rpc';
+    return true;
+  }catch(e1){
+    if(/404|PGRST202|Could not find/i.test(String(e1.message||e1))) Waktu.rpcMissing = true;
+    // Cadangan: header "Date" dari respons server (hanya terbaca kalau server mengizinkannya lewat CORS)
+    try{
+      const tt0 = performance.now();
+      const res = await fetch(SUPABASE_URL+'/rest/v1/', {method:'GET', headers: supabaseHeaders()});
+      const tt1 = performance.now();
+      const d = res.headers.get('date');
+      if(d && !isNaN(Date.parse(d))){
+        Waktu.serverMsAtSync = Date.parse(d) + 500 + (tt1-tt0)/2; Waktu.perfAtSync = tt1; Waktu.syncedAtPerf = tt1; Waktu.verified = true; Waktu.source = 'header';
+        return true;
+      }
+    }catch(e2){}
+    Waktu.verified = false;
+    return false;
+  }
+}
+function todayISO(){ return fmtWaktuRS(trustedNowMs()).date; }
 async function getAbsensiLog(pegawaiId, dateISO){
   try{
     const r = await Storage.get('absensi-log:'+pegawaiId+':'+dateISO, true);
@@ -1418,8 +1466,8 @@ async function getAbsensiLogsMulti(pegawaiIds, dateISOs){
   return map;
 }
 function isoDateOffset(days){
-  const d = new Date(); d.setDate(d.getDate()+days);
-  return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+  const t = todayISO(); const u = new Date(Date.UTC(+t.slice(0,4), +t.slice(5,7)-1, +t.slice(8,10)+days));
+  return u.getUTCFullYear()+'-'+String(u.getUTCMonth()+1).padStart(2,'0')+'-'+String(u.getUTCDate()).padStart(2,'0');
 }
 /** Cari sesi absen yang masih "terbuka" (sudah masuk, belum pulang) — mendukung shift malam yang
  * melewati tengah malam (mis. masuk jam 21:00, baru pulang besok jam 07:00). Kalau hari ini belum
@@ -1467,6 +1515,7 @@ function clearPendingAbsen(pegawaiId){
 
 /** Langkah 1: ambil lokasi GPS, verifikasi identitas, dan susun data entri absen — BELUM dikirim ke server. */
 async function buildAbsenEntry(pegawaiId, jenis, foto){ // jenis: 'masuk' | 'pulang'; foto: dataURL selfie (opsional, dari captureSelfie)
+  await syncWaktuServer(20000); // WAJIB sebelum menentukan tanggal sesi: acuan waktu = server, bukan jam HP
   const sessionPromise = getActiveAbsenSession(pegawaiId); // mulai diambil dari sekarang, berbarengan dengan proses GPS & verifikasi di bawah
   notifyNetworkStatus('📍 Mengambil lokasi GPS…');
   const loc = await getLocationWithSpoofCheck();
@@ -1497,8 +1546,17 @@ async function buildAbsenEntry(pegawaiId, jenis, foto){ // jenis: 'masuk' | 'pul
   if(log[jenis]){
     throw new Error('Absen '+(jenis==='masuk'?'Masuk':'Pulang')+' untuk sesi ini SUDAH tercatat pukul '+log[jenis].jam+' dan terkunci — tidak bisa ditimpa lagi.');
   }
-  const now = new Date();
-  const jam = now.toTimeString().slice(0,5);
+  await syncWaktuServer(30000); // segarkan lagi kalau proses verifikasi memakan waktu lama
+  const nowMs = trustedNowMs();
+  const jam = fmtWaktuRS(nowMs).time;          // jam resmi = jam server (WIB), BUKAN jam HP
+  const hpMs = Date.now();
+  const selisihHpDetik = Waktu.verified ? Math.round((hpMs-nowMs)/1000) : null; // + = jam HP lebih cepat dari server
+  const waktuFlags = [];
+  if(Waktu.verified && Math.abs(selisihHpDetik) >= BATAS_SELISIH_JAM_MENIT*60){
+    const mnt = Math.round(Math.abs(selisihHpDetik)/60);
+    waktuFlags.push('Jam HP '+(selisihHpDetik>0?'lebih cepat ':'lebih lambat ')+mnt+' menit dari jam server (jam diubah?)');
+  }
+  if(!Waktu.verified && STORAGE_MODE==='supabase') waktuFlags.push('Waktu belum terverifikasi server (memakai jam HP)');
   let fotoFinal = foto || null;
   if(fotoFinal && STORAGE_MODE==='supabase'){
     // Mode Supabase: unggah foto ke Storage terpisah (bukan ditempel base64 di dalam record) — record jadi
@@ -1506,7 +1564,9 @@ async function buildAbsenEntry(pegawaiId, jenis, foto){ // jenis: 'masuk' | 'pul
     notifyNetworkStatus('🖼️ Mengunggah foto…');
     fotoFinal = await uploadFotoToSupabase(fotoFinal, pegawaiId+'/'+dateISO+'-'+jenis+'.jpg');
   }
-  const entryData = { jam, lat:loc.lat, lng:loc.lng, akurasi:loc.akurasi, suspicious:loc.suspicious, suspicionFlags:loc.flags, foto: fotoFinal };
+  const flagsAll = (loc.flags||[]).concat(waktuFlags);
+  const entryData = { jam, lat:loc.lat, lng:loc.lng, akurasi:loc.akurasi, suspicious: !!(loc.suspicious || waktuFlags.length), suspicionFlags:flagsAll, foto: fotoFinal,
+    waktuServer: !!Waktu.verified, tsKlien: Math.round(nowMs), jamHp: new Date(hpMs).toTimeString().slice(0,5), selisihHpDetik };
   return { pegawaiId, jenis, dateISO, jam, entryData, savedAt: Date.now() };
 }
 
@@ -1517,8 +1577,23 @@ async function sendAbsenEntry(entry){
   notifyNetworkStatus('☁️ Menghubungi server (jangan tutup/refresh halaman)…');
   const freshLog = await getAbsensiLog(entry.pegawaiId, entry.dateISO); // status TERKINI di server, bukan snapshot lama
   if(freshLog[entry.jenis]) return freshLog[entry.jenis]; // sudah tersimpan dari percobaan sebelumnya — jangan kirim dobel
-  freshLog[entry.jenis] = entry.entryData;
   notifyNetworkStatus('💾 Menyimpan absen ke server…');
+  if(STORAGE_MODE==='supabase' && !Waktu.rpcMissing){
+    // Jalur AMAN: server sendiri yang menetapkan jam & tanggal (tidak bisa dipalsukan dari HP) dan menolak menimpa.
+    try{
+      const saved = await supabaseRetry_(()=>supabaseFetchRaw('/rest/v1/rpc/absen_submit', {
+        method:'POST', headers: supabaseHeaders({'Content-Type':'application/json',Accept:'application/json'}),
+        body: JSON.stringify({ p_pegawai: entry.pegawaiId, p_jenis: entry.jenis, p_date: entry.dateISO, p_data: entry.entryData })
+      }, 15000));
+      if(saved) return saved;
+    }catch(e){
+      if(/PGRST202|Could not find|404/i.test(String(e.message||e))) Waktu.rpcMissing = true; // fungsi belum dipasang di Supabase → jalur lama
+      else throw e;
+    }
+    entry.entryData.suspicious = true;
+    entry.entryData.suspicionFlags = (entry.entryData.suspicionFlags||[]).concat(['Disimpan lewat jalur lama (fungsi server absen_submit belum dipasang)']);
+  }
+  freshLog[entry.jenis] = entry.entryData;
   await saveAbsensiLog(entry.pegawaiId, entry.dateISO, freshLog);
   return entry.entryData;
 }
@@ -1577,6 +1652,15 @@ async function getShiftForDate(pegawaiId, dateISO){
   return getShiftForPegawai(pegawaiId);
 }
 
+/** Ringkas catatan mencurigakan (jam HP tak sinkron / belum terverifikasi / terlambat terkirim) dari satu log harian. */
+function waktuCatatan(log){
+  const out = [];
+  ['masuk','pulang'].forEach(j=>{
+    const e = log && log[j];
+    if(e && e.suspicious && e.suspicionFlags && e.suspicionFlags.length) out.push((j==='masuk'?'Masuk: ':'Pulang: ')+e.suspicionFlags.join('; '));
+  });
+  return out.join(' | ');
+}
 /** Pindai rentang tanggal untuk catatan absen yang ditandai mencurigakan (indikasi GPS palsu). */
 async function scanSuspiciousLogs(pegawaiId, startISO, endISO){
   const start = new Date(startISO), end = new Date(endISO);
@@ -2246,6 +2330,9 @@ async function renderAbsenMandiri(body){
   const pulangEl = el('div',null,[el('div',{style:'font-size:10.5px;color:var(--ink-soft);'},['Pulang']), el('div',{style:'font-family:Lexend;font-weight:800;font-size:18px;color:'+(pulangLocked?'var(--green)':'var(--teal)')+';'},[sessionLog.pulang ? sessionLog.pulang.jam : '—'])]);
   statusRow.appendChild(masukEl); statusRow.appendChild(pulangEl);
   todayBox.appendChild(statusRow);
+  if(STORAGE_MODE==='supabase'){
+    todayBox.appendChild(el('div',{style:'font-size:10.5px;color:var(--ink-soft);margin-top:6px;'},[Waktu.verified ? '🕒 Jam absen memakai jam server RS — mengubah jam HP tidak berpengaruh.' : '⚠️ Jam server belum tersinkron — absen tetap bisa, tetapi akan diberi tanda untuk ditinjau HRD.']));
+  }
   panel.appendChild(todayBox);
 
   const btnRow = el('div',{style:'display:flex;gap:10px;'});
@@ -4093,14 +4180,14 @@ function exportJamKedatanganExcel(rows, tanggalLabel, unitLabel){
     ['Tanggal: '+tanggalLabel],
     ['Diunduh: '+new Date().toLocaleString('id-ID')],
     [],
-    ['Tanggal','Nama','Unit','Shift','Jam Masuk','Jam Pulang','Status'],
+    ['Tanggal','Nama','Unit','Shift','Jam Masuk','Jam Pulang','Status','Catatan Waktu/Lokasi'],
   ];
   rows.forEach(r=>{
     const statusLabel = {cuti:'Cuti', libur:'Libur', ontime:'Tepat Waktu', telat:'Terlambat', alpha:'Belum Absen', '-':'-'}[r.statusMasuk] || r.statusMasuk;
-    data.push([r.tanggal||tanggalLabel, r.nama, r.unit, r.shiftNama, r.jamMasuk||'-', r.jamPulang||'-', statusLabel]);
+    data.push([r.tanggal||tanggalLabel, r.nama, r.unit, r.shiftNama, r.jamMasuk||'-', r.jamPulang||'-', statusLabel, r.catatanWaktu||'']);
   });
   const ws = XLSX.utils.aoa_to_sheet(data);
-  ws['!cols'] = [{wch:13},{wch:26},{wch:16},{wch:14},{wch:12},{wch:12},{wch:14}];
+  ws['!cols'] = [{wch:13},{wch:26},{wch:16},{wch:14},{wch:12},{wch:12},{wch:14},{wch:50}];
   ws['!merges'] = [{s:{r:0,c:0},e:{r:0,c:6}},{s:{r:1,c:0},e:{r:1,c:6}},{s:{r:2,c:0},e:{r:2,c:6}},{s:{r:3,c:0},e:{r:3,c:6}}];
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Jam Kedatangan');
@@ -4224,6 +4311,7 @@ async function renderRekapAbsensi(body){
       else if(r.statusMasuk==='alpha') statusBadgeEl = el('span',{class:'badge draft'},['Belum Absen']);
       else statusBadgeEl = el('span',{class:'badge draft'},['-']);
       const jamMasukCell = el('td',{style:'font-weight:700;'},[r.jamMasuk||'—']);
+      if(r.catatanWaktu) jamMasukCell.appendChild(el('span',{title:r.catatanWaktu, style:'margin-left:5px;cursor:help;', onclick:()=>alert('⚠️ '+r.nama+' ('+r.tanggal+')\n\n'+r.catatanWaktu)},['⚠️']));
       if(r.fotoMasuk){
         jamMasukCell.appendChild(el('button',{class:'btn btn-outline btn-sm', style:'margin-left:6px;padding:2px 7px;', title:'Lihat foto selfie absen masuk', onclick:()=>showPhotoLightbox(r.fotoMasuk, r.nama+' — Absen Masuk '+r.jamMasuk+' ('+r.tanggal+')')},['📷']));
       }
@@ -4266,7 +4354,7 @@ async function renderRekapAbsensi(body){
       } else if(new Date(dateVal) <= new Date(todayISO())) {
         statusMasuk = 'alpha';
       }
-      return { tanggal:dateVal, nama:p.nama, unit:unitName(p.unitId), jamMasuk: log.masuk?log.masuk.jam:null, jamPulang: log.pulang?log.pulang.jam:null, statusMasuk, shiftNama: shift.cuti?shift.nama:(shift.libur?'Libur':shift.nama), fotoMasuk: log.masuk?log.masuk.foto:null, fotoPulang: log.pulang?log.pulang.foto:null };
+      return { tanggal:dateVal, nama:p.nama, unit:unitName(p.unitId), jamMasuk: log.masuk?log.masuk.jam:null, jamPulang: log.pulang?log.pulang.jam:null, catatanWaktu: waktuCatatan(log), statusMasuk, shiftNama: shift.cuti?shift.nama:(shift.libur?'Libur':shift.nama), fotoMasuk: log.masuk?log.masuk.foto:null, fotoPulang: log.pulang?log.pulang.foto:null };
     });
     lastJamRows = rows;
     jamDlBtn.style.display = '';
@@ -6045,7 +6133,7 @@ function buildValidasiHRDModal(modal){
   modal.appendChild(el('div',{class:'small-note'},['Rata-rata Sikap Kerja: '+f.sikapAvg.toFixed(2)+' / 4 ('+SCORE_LABEL[Math.round(f.sikapAvg)]+'). Aspek bertanda "otomatis" bersumber langsung dari data absensi dan tidak dapat diubah manual; aspek bertanda "input unit" dinilai oleh Kepala Unit. HRD memastikan kesesuaian keduanya dengan catatan kepegawaian.']));
 
   // Peringatan indikasi lokasi palsu — dimuat async, hanya terlihat oleh HRD (tidak pernah ditampilkan ke pegawai sendiri)
-  const suspicionBox = el('div',{id:'hrd-suspicion-box'},[el('div',{class:'small-note'},['Memeriksa indikasi lokasi palsu pada absen mandiri…'])]);
+  const suspicionBox = el('div',{id:'hrd-suspicion-box'},[el('div',{class:'small-note'},['Memeriksa indikasi lokasi/jam palsu pada absen mandiri…'])]);
   modal.appendChild(suspicionBox);
   (async ()=>{
     const now = new Date();
@@ -6055,10 +6143,10 @@ function buildValidasiHRDModal(modal){
     if(!box) return; // modal sudah ditutup sebelum selesai memuat
     box.innerHTML = '';
     if(flagged.length===0){
-      box.appendChild(el('div',{class:'small-note'},['✓ Tidak ada indikasi lokasi palsu pada absen mandiri bulan ini.']));
+      box.appendChild(el('div',{class:'small-note'},['✓ Tidak ada indikasi lokasi/jam palsu pada absen mandiri bulan ini.']));
     } else {
       const warnBox = el('div',{style:'background:var(--red-soft);color:var(--red);padding:10px 12px;border-radius:8px;font-size:12px;margin-top:4px;'});
-      warnBox.appendChild(el('div',{style:'font-weight:700;margin-bottom:6px;'},['🚩 Indikasi lokasi palsu terdeteksi ('+flagged.length+' kejadian) — mohon ditinjau sebelum menyetujui:']));
+      warnBox.appendChild(el('div',{style:'font-weight:700;margin-bottom:6px;'},['🚩 Indikasi lokasi/jam palsu terdeteksi ('+flagged.length+' kejadian) — mohon ditinjau sebelum menyetujui:']));
       flagged.slice(0,8).forEach(f=>{
         warnBox.appendChild(el('div',{style:'margin-top:4px;'},['• '+f.tanggal+' ('+(f.jenis==='masuk'?'Absen Masuk':'Absen Pulang')+'): '+f.alasan.join('; ')]));
       });
@@ -6321,6 +6409,8 @@ function mountDemoBanner(){
     state.loaded = true;
     await render(); // tampil instan dari cache lokal dulu, sambil data terbaru diambil di belakang layar
   }
+  syncWaktuServer(); // sinkron jam server di latar belakang
+  document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) syncWaktuServer(60000); });
   await loadAll(); // selalu ambil data terbaru dari server (menimpa cache kalau ada perubahan)
   await render();
 })();
