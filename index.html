@@ -1711,6 +1711,121 @@ async function computeAttendanceSummary(pegawaiId, startISO, endISO, logsMap){
   return { hadir_persen, terlambat:terlambatHari, alpha:alphaHari, totalHari, hadirHari, liburHari, cutiHari, shiftNama: [...shiftNamaTerpakai].join(', ')||'Default' };
 }
 
+/* ============ ABSENSI OTOMATIS UNTUK PENILAIAN SIKAP KERJA ============
+ * Dulu HRD/Kepala Unit harus menekan "Isi dari Data Absensi Otomatis" pegawai demi pegawai. Dengan ratusan pegawai itu
+ * tidak realistis, jadi sekarang angka % hadir, jumlah terlambat, dan alpha dihitung otomatis untuk SEMUA pegawai pada
+ * periode yang dipilih setiap kali layar Input Penilaian / Validasi HRD / Rekap dibuka (maksimal sekali per 10 menit).
+ * Aturan pengaman:
+ *  - Hari ini TIDAK dihitung (pegawai yang belum sempat absen pagi ini tidak boleh dianggap alpha). Hitungan sampai kemarin
+ *    untuk periode yang masih berjalan, atau sampai akhir bulan untuk periode yang sudah lewat.
+ *  - Pegawai yang tidak punya SATU PUN catatan Absen Mandiri pada periode itu (mis. belum memakai Absen Mandiri) TIDAK
+ *    diisi otomatis — kalau diisi, semuanya akan terhitung alpha dan nilainya jatuh secara keliru. Dihitung terpisah di laporan.
+ *  - Isian yang sudah diubah manual (pegawai.absensi_manual) tidak ditimpa, kecuali Admin/HRD memilih "timpa".
+ *  - Penilaian yang sudah divalidasi HRD / Diklat / Final dikunci — angkanya tidak berubah lagi. */
+const BULAN_ID = {januari:1,jan:1,februari:2,feb:2,maret:3,mar:3,april:4,apr:4,mei:5,juni:6,jun:6,juli:7,jul:7,agustus:8,agu:8,agt:8,agust:8,september:9,sep:9,sept:9,oktober:10,okt:10,november:11,nov:11,nopember:11,desember:12,des:12};
+const ABSEN_AUTO_BEKU = ['VALIDASI_HRD','VALIDASI_DIKLAT','FINAL'];
+function periodeKeRentang(periode){
+  const t = String(periode||'').toLowerCase();
+  let bln=null, thn=null, m;
+  if((m = t.match(/(\d{4})[-\/](\d{1,2})/))){ thn=+m[1]; bln=+m[2]; }
+  else if((m = t.match(/([a-z]+)\D+(\d{4})/))){ bln = BULAN_ID[m[1]]||null; thn=+m[2]; }
+  if(!bln || bln<1 || bln>12 || !thn) return null;
+  const pad = n=>String(n).padStart(2,'0');
+  const start = thn+'-'+pad(bln)+'-01';
+  const lastD = new Date(Date.UTC(thn, bln, 0)).getUTCDate();
+  const lastISO = thn+'-'+pad(bln)+'-'+pad(lastD);
+  const today = todayISO();
+  if(start >= today) return null;                 // periode belum berjalan / baru mulai hari ini: belum ada hari yang bisa dihitung
+  const kemarin = isoDateOffset(-1);
+  const end = lastISO <= kemarin ? lastISO : kemarin;
+  return { start, end, penuh: lastISO <= kemarin };
+}
+async function sinkronAbsensiPenilaian(opts){
+  const periode = opts.periode || state.periode;
+  const r = periodeKeRentang(periode);
+  if(!r) return { error:'Periode "'+periode+'" belum bisa dihitung (belum berjalan atau namanya tidak dikenali — gunakan format "Oktober 2026").' };
+  const dates = [];
+  for(let d=new Date(r.start+'T00:00:00'); ; d.setDate(d.getDate()+1)){
+    const iso = d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+    if(iso > r.end) break; dates.push(iso);
+  }
+  const list = opts.pegawai || [];
+  const hasil = { total:list.length, diperbarui:0, sama:0, tanpaData:0, manual:0, beku:0, dari:r.start, sampai:r.end, penuh:r.penuh };
+  const BATCH = 30;
+  for(let i=0; i<list.length; i+=BATCH){
+    const grp = list.slice(i, i+BATCH);
+    const logsMap = await getAbsensiLogsMulti(grp.map(p=>p.id), dates);
+    const toSave = [];
+    for(const p of grp){
+      const pn = getPenilaian(periode, p.id);
+      if(ABSEN_AUTO_BEKU.includes(pn.status)){ hasil.beku++; continue; }
+      if(pn.absensi_manual && !opts.timpaManual){ hasil.manual++; continue; }
+      if(state.modal && state.modal.pegawaiId===p.id){ continue; } // sedang dibuka di layar edit — jangan diubah diam-diam
+      const sum = await computeAttendanceSummary(p.id, r.start, r.end, logsMap);
+      if(sum.hadirHari===0){ hasil.tanpaData++; continue; }
+      const lama = pn.absensi || {};
+      const sama = lama.hadir_persen===sum.hadir_persen && lama.terlambat===sum.terlambat && lama.alpha===sum.alpha;
+      const infoLama = pn.absensi_auto;
+      pn.absensi = { hadir_persen:sum.hadir_persen, terlambat:sum.terlambat, alpha:sum.alpha, sp_aktif: lama.sp_aktif||0 };
+      pn.absensi_manual = false;
+      pn.absensi_auto = { dari:r.start, sampai:r.end, hariKerja:sum.totalHari, hadir:sum.hadirHari, cuti:sum.cutiHari, libur:sum.liburHari, penuh:r.penuh };
+      if(sama) hasil.sama++; else hasil.diperbarui++;
+      if(!sama || !infoLama || infoLama.sampai!==r.end) toSave.push(p.id);
+    }
+    await mapLimit(toSave, 8, async (id)=>{ await savePenilaian(periode, id); });
+    if(opts.onProgress) opts.onProgress(Math.min(i+BATCH, list.length), list.length);
+  }
+  return hasil;
+}
+function paintAbsenSyncBanner(){
+  const box = document.getElementById('absen-sync-banner'); const st = state.absenSync;
+  if(!box || !st) return;
+  box.innerHTML = '';
+  let msg, bg='var(--teal-soft,#e6f4f1)', col='var(--teal,#0b6e66)';
+  if(st.running){ msg = '⏳ Menghitung absensi otomatis dari Absen Mandiri… '+st.done+' / '+st.total+' pegawai'; }
+  else if(st.hasil && st.hasil.error){ msg = '⚠️ '+st.hasil.error; bg='var(--gold-soft,#fff4d6)'; col='var(--gold,#8a6100)'; }
+  else if(st.hasil){
+    const h = st.hasil; const parts = [];
+    parts.push('✓ Absensi periode '+st.periode+' dihitung otomatis dari Absen Mandiri ('+h.dari+' s/d '+h.sampai+(h.penuh?'':', hari ini belum dihitung')+')');
+    parts.push(h.diperbarui+' diperbarui, '+h.sama+' sudah sesuai');
+    if(h.tanpaData) parts.push(h.tanpaData+' pegawai belum punya data Absen Mandiri (tidak diisi otomatis)');
+    if(h.manual) parts.push(h.manual+' diisi manual (tidak ditimpa)');
+    if(h.beku) parts.push(h.beku+' sudah divalidasi (terkunci)');
+    msg = parts.join(' · ');
+  } else return;
+  box.appendChild(el('div',{style:'flex:1;min-width:220px;font-size:12px;'},[msg]));
+  if(!st.running){
+    box.style.background = bg; box.style.color = col;
+    box.appendChild(el('button',{class:'btn btn-outline btn-sm', onclick:()=>{ jalankanSinkronAbsen(st.list, st.key, false); }},['🔄 Hitung ulang']));
+    if((state.role==='admin'||state.role==='hrd') && st.hasil && st.hasil.manual){
+      box.appendChild(el('button',{class:'btn btn-outline btn-sm', title:'Hitung ulang SEMUA, termasuk yang diisi manual', onclick:()=>{
+        if(!confirm('Timpa juga isian absensi yang diubah manual ('+st.hasil.manual+' pegawai) dengan hasil hitungan otomatis?')) return;
+        jalankanSinkronAbsen(st.list, st.key, true);
+      }},['Timpa isian manual']));
+    }
+  }
+}
+async function jalankanSinkronAbsen(list, key, timpaManual){
+  const periode = state.periode;
+  const st = state.absenSync = { periode, key, list, running:true, done:0, total:list.length, hasil:null, at:Date.now() };
+  paintAbsenSyncBanner();
+  try{
+    st.hasil = await sinkronAbsensiPenilaian({ periode, pegawai:list, timpaManual, onProgress:(d,t)=>{ st.done=d; st.total=t; paintAbsenSyncBanner(); } });
+  }catch(e){ st.hasil = { error:'Gagal menghitung absensi otomatis: '+(e.message||e) }; }
+  st.running = false; st.at = Date.now();
+  paintAbsenSyncBanner();
+  if(st.hasil && st.hasil.diperbarui>0 && !state.modal && state.periode===periode) rerender();
+}
+/** Pasang pita status + jalankan hitung otomatis di latar belakang bila belum dihitung dalam 10 menit terakhir. */
+function absenSyncBanner(body, list, key){
+  const box = el('div',{id:'absen-sync-banner', class:'no-print', style:'display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:10px 14px;border-radius:10px;margin-bottom:12px;'});
+  body.appendChild(box);
+  const st = state.absenSync;
+  const segar = st && st.periode===state.periode && (st.key===key || st.key==='all') && (st.running || (Date.now()-st.at) < 10*60000);
+  if(segar){ paintAbsenSyncBanner(); }
+  else if(list.length>0){ jalankanSinkronAbsen(list, key, false); }
+}
+
 function slugify(nama){
   return 'asp_'+nama.toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'').slice(0,30)+'_'+Math.floor(Math.random()*10000);
 }
@@ -4138,6 +4253,7 @@ function renderInputAI(body){
       const applyBtn = el('button',{class:'btn btn-primary btn-sm',style:'margin-top:10px;', onclick:()=>{
         const pn = getPenilaian(state.periode, p.id);
         if(!['DRAFT','REVISI_HRD','REVISI_DIKLAT'].includes(pn.status)){ alert('Penilaian pegawai ini sudah diajukan/divalidasi dan tidak bisa ditimpa lewat AI. Ubah manual di menu Input Penilaian bila diperlukan.'); return; }
+        if(res.absensi) pn.absensi_manual = true; // dari dokumen/AI — jangan ditimpa hitungan otomatis
         if(res.absensi) pn.absensi = {hadir_persen:res.absensi.hadir_persen??pn.absensi.hadir_persen, terlambat:res.absensi.terlambat??pn.absensi.terlambat, alpha:res.absensi.alpha??pn.absensi.alpha, sp_aktif:pn.absensi.sp_aktif};
         if(res.kinerja) pn.kinerja_score = {...pn.kinerja_score, ...res.kinerja};
         if(res.mutu) pn.mutu_score = {...pn.mutu_score, ...res.mutu};
@@ -4998,6 +5114,7 @@ function renderInput(body){
     body.appendChild(el('div',{class:'panel'},[el('div',{class:'empty'},['Belum ada pegawai terdaftar di unit '+unitName(state.currentUnitId)+'. Tambahkan lewat menu Admin → Data Pegawai.'])]));
     return;
   }
+  absenSyncBanner(body, myStaff, 'unit:'+state.currentUnitId);
   const panel = el('div',{class:'panel'});
   panel.appendChild(el('h3',null,['Pegawai Unit '+unitName(state.currentUnitId)]));
   const w = weightForUnit(state.currentUnitId);
@@ -5018,6 +5135,7 @@ function renderInput(body){
 
 /* ============ VALIDASI HRD ============ */
 function renderValidasiHRD(body){
+  absenSyncBanner(body, state.pegawai, 'all');
   const antrianAll = state.pegawai.filter(p=>{
     const pn = getPenilaian(state.periode,p.id);
     return pn.status==='DIAJUKAN';
@@ -5326,6 +5444,7 @@ function downloadLaporanMassal(list, periode){
 }
 
 function renderRekap(body){
+  absenSyncBanner(body, state.pegawai, 'all');
   const finals = state.pegawai.map(p=>({p, pn:getPenilaian(state.periode,p.id)}))
     .map(x=>({...x, f:computeFinal(x.pn, x.p.unitId)}));
 
@@ -5993,19 +6112,26 @@ function buildInputPenilaianModal(modal){
 
   // Sikap Kerja - absensi
   modal.appendChild(el('h4',{style:'margin:14px 0 8px;font-size:13px;'},['1. Sikap Kerja — Data Absensi (Fakta)']));
+  let manualTouched = !!pn.absensi_manual;
+  { const ai = pn.absensi_auto;
+    if(pn.absensi_manual) modal.appendChild(el('div',{class:'small-note',style:'margin-bottom:8px;color:var(--gold);'},['✏️ Angka absensi diisi manual — tidak ditimpa hitungan otomatis.']));
+    else if(ai) modal.appendChild(el('div',{class:'small-note',style:'margin-bottom:8px;color:var(--teal);'},['✓ Terisi otomatis dari Absen Mandiri ('+ai.dari+' s/d '+ai.sampai+'): '+ai.hadir+' hadir dari '+ai.hariKerja+' hari kerja'+(ai.cuti?', '+ai.cuti+' hari cuti tidak dihitung':'')+'.']));
+    else modal.appendChild(el('div',{class:'small-note',style:'margin-bottom:8px;'},['Belum ada data Absen Mandiri untuk periode ini — isi manual, atau tekan tombol di bawah bila datanya sudah ada.'])); }
 
   if(editable){
     const pullRow = el('div',{style:'display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px;'});
     const now = new Date();
     const firstDay = now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-01';
     const todayStr = todayISO();
-    const dStart = el('input',{type:'date', value:firstDay, style:'padding:6px 8px;border:1px solid var(--line);border-radius:6px;font-size:12px;'});
-    const dEnd = el('input',{type:'date', value:todayStr, style:'padding:6px 8px;border:1px solid var(--line);border-radius:6px;font-size:12px;'});
+    const rentangPeriode = periodeKeRentang(state.periode);
+    const dStart = el('input',{type:'date', value: rentangPeriode ? rentangPeriode.start : firstDay, style:'padding:6px 8px;border:1px solid var(--line);border-radius:6px;font-size:12px;'});
+    const dEnd = el('input',{type:'date', value: rentangPeriode ? rentangPeriode.end : todayStr, style:'padding:6px 8px;border:1px solid var(--line);border-radius:6px;font-size:12px;'});
     const pullBtn = el('button',{class:'btn btn-outline btn-sm', onclick: async ()=>{
       pullBtn.disabled = true; pullBtn.textContent = 'Menghitung…';
       try{
         const sum = await computeAttendanceSummary(p.id, dStart.value, dEnd.value);
         fHadir.value = sum.hadir_persen; fTerlambat.value = sum.terlambat; fAlpha.value = sum.alpha;
+        manualTouched = false; // hasil tarikan otomatis, bukan isian manual
         updateSikapPreview();
         alert('Terisi dari '+sum.hadirHari+'/'+sum.totalHari+' hari kerja data Absen Mandiri ('+dStart.value+' s/d '+dEnd.value+'), shift: '+sum.shiftNama+(sum.liburHari?' · '+sum.liburHari+' hari libur (tidak dihitung)':'')+(sum.cutiHari?' · '+sum.cutiHari+' hari cuti disetujui (tidak dihitung)':'')+'. Silakan cek lalu simpan.');
       }catch(e){ alert('Gagal mengambil data absensi: '+(e.message||e)); }
@@ -6023,6 +6149,7 @@ function buildInputPenilaianModal(modal){
   const fTerlambat = el('input',{type:'number',min:'0',value:pn.absensi.terlambat, disabled: !editable});
   const fAlpha = el('input',{type:'number',min:'0',value:pn.absensi.alpha, disabled: !editable});
   const fSp = el('input',{type:'number',min:'0',value:pn.absensi.sp_aktif, disabled: !editable});
+  [fHadir, fTerlambat, fAlpha].forEach(inp=>inp.addEventListener('input', ()=>{ manualTouched = true; }));
   abGrid.appendChild(el('div',{class:'field'},[el('label',null,['% Kehadiran']),fHadir]));
   abGrid.appendChild(el('div',{class:'field'},[el('label',null,['Jumlah Terlambat (kali)']),fTerlambat]));
   abGrid.appendChild(el('div',{class:'field'},[el('label',null,['Alpha / Tanpa Keterangan (hari)']),fAlpha]));
@@ -6068,6 +6195,7 @@ function buildInputPenilaianModal(modal){
   if(editable){
     actions.appendChild(el('button',{class:'btn btn-outline', onclick:()=>{
       pn.absensi = {hadir_persen:Number(fHadir.value)||0, terlambat:Number(fTerlambat.value)||0, alpha:Number(fAlpha.value)||0, sp_aktif:Number(fSp.value)||0};
+      pn.absensi_manual = manualTouched;
       pn.sikap_score = sikapScores; pn.kinerja_score = kinScores; pn.mutu_score = mutuScores;
       bgSave(savePenilaian(state.periode, p.id));
       alert('Draft tersimpan.'); rerender();
@@ -6078,6 +6206,7 @@ function buildInputPenilaianModal(modal){
       const mOk = state.aspekConfig.mutu.every(a=>typeof mutuScores[a.key]==='number');
       if(!sOk || !kOk || !mOk){ alert('Lengkapi semua aspek penilaian terlebih dahulu.'); return; }
       pn.absensi = {hadir_persen:Number(fHadir.value)||0, terlambat:Number(fTerlambat.value)||0, alpha:Number(fAlpha.value)||0, sp_aktif:Number(fSp.value)||0};
+      pn.absensi_manual = manualTouched;
       pn.sikap_score = sikapScores; pn.kinerja_score = kinScores; pn.mutu_score = mutuScores;
       pn.status = 'DIAJUKAN'; pn.submitted_by_unit = true;
       bgSave(savePenilaian(state.periode, p.id));
