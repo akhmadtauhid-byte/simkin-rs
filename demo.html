@@ -1695,6 +1695,22 @@ async function scanSuspiciousLogs(pegawaiId, startISO, endISO){
 }
 
 function jamKeMenit(h){ const a = String(h||'0:0').split(':').map(Number); return (a[0]||0)*60+(a[1]||0); }
+/** Lama kerja satu hari (menit) dari jam masuk–pulang; null bila tidak lengkap atau janggal (tidak ikut dijumlahkan). */
+function durasiMenit(log, shift){
+  if(!log || !log.masuk || !log.pulang) return null;
+  const overnight = !!(shift && shift.jamMulai && shift.jamSelesai && jamKeMenit(shift.jamSelesai) <= jamKeMenit(shift.jamMulai));
+  const m = jamKeMenit(log.masuk.jam), pu = jamKeMenit(log.pulang.jam);
+  const d = overnight ? (((pu-m)%1440)+1440)%1440 : (pu-m);
+  if(d < ((state.aturanAbsen&&state.aturanAbsen.minDurasiMenit)||30) || d > 20*60) return null;
+  return d;
+}
+/** Lama kerja yang dijadwalkan untuk shift itu (menit); null bila shift tidak punya jam selesai. */
+function durasiJadwal(shift){
+  if(!shift || !shift.jamMulai || !shift.jamSelesai) return null;
+  const a = jamKeMenit(shift.jamMulai), b = jamKeMenit(shift.jamSelesai);
+  return ((b-a)%1440+1440)%1440 || null;
+}
+function fmtDurasi(m){ return (m==null) ? '—' : Math.floor(m/60)+'j '+String(Math.round(m%60)).padStart(2,'0')+'m'; }
 /** Periksa kelengkapan & kewajaran absen satu hari: (1) ada Absen Masuk tapi tidak ada Absen Pulang pada hari yang sudah lewat,
  * (2) jam pulang lebih awal dari jam masuk (di luar shift malam) atau selisihnya terlalu pendek (salah tekan/jam HP kacau). */
 function cekLogHarian(log, shift, dateISO){
@@ -1716,12 +1732,12 @@ function cekLogHarian(log, shift, dateISO){
   return out;
 }
 function cekFieldsRow(log, shift, dateISO){
-  if(shift && (shift.cuti||shift.libur) && !(log&&log.masuk)) return {tanpaPulang:false, janggal:null};
-  const c = cekLogHarian(log, shift, dateISO); return { tanpaPulang:c.tanpaPulang, janggal:c.janggal };
+  if(shift && (shift.cuti||shift.libur) && !(log&&log.masuk)) return {tanpaPulang:false, janggal:null, durasi:null};
+  const c = cekLogHarian(log, shift, dateISO); return { tanpaPulang:c.tanpaPulang, janggal:c.janggal, durasi:durasiMenit(log, shift) };
 }
 async function computeAttendanceSummary(pegawaiId, startISO, endISO, logsMap){
   const start = new Date(startISO), end = new Date(endISO);
-  let totalHari=0, hadirHari=0, terlambatHari=0, alphaHari=0, liburHari=0, cutiHari=0, tanpaPulangHari=0, janggalHari=0;
+  let totalHari=0, hadirHari=0, terlambatHari=0, alphaHari=0, liburHari=0, cutiHari=0, tanpaPulangHari=0, janggalHari=0, menitKerja=0, hariDurasi=0, menitJadwal=0;
   const shiftNamaTerpakai = new Set();
   for(let d=new Date(start); d<=end; d.setDate(d.getDate()+1)){
     const iso = d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
@@ -1737,6 +1753,7 @@ async function computeAttendanceSummary(pegawaiId, startISO, endISO, logsMap){
       const cek = cekLogHarian(log, shift, iso);
       if(cek.tanpaPulang) tanpaPulangHari++;
       if(cek.janggal) janggalHari++;
+      { const dm = durasiMenit(log, shift); if(dm!=null){ menitKerja += dm; hariDurasi++; const jd = durasiJadwal(shift); if(jd!=null) menitJadwal += jd; } }
       if(cek.tanpaPulang && state.aturanAbsen.tanpaPulang==='alpha'){
         alphaHari++; // kebijakan RS: tidak absen pulang = tidak dihitung hadir
       } else {
@@ -1751,7 +1768,7 @@ async function computeAttendanceSummary(pegawaiId, startISO, endISO, logsMap){
     }
   }
   const hadir_persen = totalHari>0 ? Math.round((hadirHari/totalHari)*1000)/10 : 100;
-  return { hadir_persen, terlambat:terlambatHari, alpha:alphaHari, totalHari, hadirHari, liburHari, cutiHari, tanpaPulang:tanpaPulangHari, janggal:janggalHari, shiftNama: [...shiftNamaTerpakai].join(', ')||'Default' };
+  return { hadir_persen, terlambat:terlambatHari, alpha:alphaHari, totalHari, hadirHari, liburHari, cutiHari, tanpaPulang:tanpaPulangHari, janggal:janggalHari, menitKerja, hariDurasi, menitJadwal, shiftNama: [...shiftNamaTerpakai].join(', ')||'Default' };
 }
 
 /* ============ ABSENSI OTOMATIS UNTUK PENILAIAN SIKAP KERJA ============
@@ -2049,6 +2066,61 @@ function renderPanelJanggal(body, staffPool, isUnitRole){
     const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'Absen Janggal'); XLSX.writeFile(wb, 'Absen-Janggal-'+dS.value+'_'+dE.value+'.xlsx');
   });
   if(pre.start && pre.end && state._autoJanggal!==false){ setTimeout(()=>{ muat(); panel.scrollIntoView({behavior:'smooth',block:'start'}); }, 50); }
+}
+
+/* ============ JAM KERJA PER PEGAWAI (rincian harian) ============ */
+async function bukaJamKerjaPegawai(p, startISO, endISO){
+  const overlay = el('div',{style:'position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:9998;display:flex;align-items:center;justify-content:center;padding:16px;'});
+  const card = el('div',{style:'background:#fff;border-radius:14px;padding:20px;max-width:900px;width:100%;max-height:90vh;overflow:auto;'});
+  overlay.appendChild(card); document.body.appendChild(overlay);
+  const tutup = ()=>{ if(overlay.parentNode) overlay.parentNode.removeChild(overlay); };
+  overlay.addEventListener('click', e=>{ if(e.target===overlay) tutup(); });
+  card.appendChild(el('div',{style:'display:flex;justify-content:space-between;align-items:flex-start;gap:10px;'},[
+    el('div',null,[el('h3',{style:'margin:0;'},['Jam Kerja — '+p.nama]), el('div',{class:'small-note'},[(p.unitId?unitName(p.unitId)+' · ':'')+startISO+' s/d '+endISO])]),
+    el('button',{class:'btn btn-outline btn-sm',onclick:tutup},['Tutup'])]));
+  const isi = el('div'); card.appendChild(isi);
+  isi.appendChild(el('div',{class:'small-note'},['Memuat…']));
+  const dates = []; for(let d=new Date(startISO+'T00:00:00'); d<=new Date(endISO+'T00:00:00'); d.setDate(d.getDate()+1)){ dates.push(d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')); }
+  const lm = await getAbsensiLogsMulti([p.id], dates);
+  const baris = []; let totMenit=0, totJadwal=0, hariKerja=0, hariHadir=0, hariDur=0;
+  for(const iso of dates){
+    if(iso > todayISO()) break;
+    const log = lm['absensi-log:'+p.id+':'+iso] || {}; const shift = await getShiftForDate(p.id, iso);
+    const cek = cekLogHarian(log, shift, iso); const dm = durasiMenit(log, shift); const jd = durasiJadwal(shift);
+    let status;
+    if(shift.cuti) status='Cuti'; else if(shift.libur && !log.masuk) status='Libur';
+    else if(!log.masuk) status = iso===todayISO() ? 'Belum absen' : 'Alpha';
+    else if(shift.libur) status = 'Hadir (hari libur)';
+    else { const [jh,mh]=shift.jamMulai.split(':').map(Number); const [jm,mm]=log.masuk.jam.split(':').map(Number);
+      status = (jm*60+mm) > (jh*60+mh+shift.toleransiMenit) ? 'Terlambat' : 'Tepat waktu'; }
+    if(!shift.cuti && !shift.libur){ hariKerja++; }
+    if(log.masuk && !shift.libur && !shift.cuti){ hariHadir++; }
+    if(dm!=null && !shift.libur && !shift.cuti){ totMenit+=dm; hariDur++; if(jd!=null) totJadwal+=jd; }
+    baris.push({iso, shift:shift.cuti?shift.nama:(shift.libur?'Libur':shift.nama), masuk:log.masuk?log.masuk.jam:null, pulang:log.pulang?log.pulang.jam:null, dm, jd, status,
+      catatan:[cek.tanpaPulang?'Tidak absen pulang':'', cek.janggal||'', waktuCatatan(log)].filter(Boolean).join(' · '),
+      fotoMasuk:log.masuk?log.masuk.foto:null, fotoPulang:log.pulang?log.pulang.foto:null});
+  }
+  isi.innerHTML = '';
+  isi.appendChild(el('div',{style:'font-size:13px;line-height:1.7;margin:10px 0;'},[
+    'Hadir ', el('b',null,[hariHadir+' / '+hariKerja]), ' hari kerja · Total jam kerja ', el('b',null,[fmtDurasi(totMenit)]),
+    (totJadwal?' dari jadwal '+fmtDurasi(totJadwal)+' ('+(totMenit>=totJadwal?'lebih ':'kurang ')+fmtDurasi(Math.abs(totMenit-totJadwal))+')':''),
+    ' · Rata-rata ', el('b',null,[hariDur?fmtDurasi(Math.round(totMenit/hariDur))+'/hari':'—']),
+    el('span',{style:'color:var(--ink-soft);'},[' (hanya hari dengan jam masuk & pulang yang wajar yang dijumlahkan: '+hariDur+' hari)'])]));
+  const t = el('table',{style:'font-size:12.5px;'});
+  t.appendChild(el('tr',null,['Tanggal','Shift','Masuk','Pulang','Durasi','Jadwal','Status','Catatan'].map(h=>el('th',null,[h]))));
+  baris.forEach(r=>{
+    const cm = el('td',{style:'font-weight:700;'},[r.masuk||'—']); if(r.fotoMasuk) cm.appendChild(el('button',{class:'btn btn-outline btn-sm',style:'margin-left:5px;padding:1px 6px;',onclick:()=>showPhotoLightbox(r.fotoMasuk,p.nama+' — Masuk '+r.masuk+' ('+r.iso+')')},['📷']));
+    const cp = el('td',{style:'font-weight:700;'},[r.pulang||'—']); if(r.fotoPulang) cp.appendChild(el('button',{class:'btn btn-outline btn-sm',style:'margin-left:5px;padding:1px 6px;',onclick:()=>showPhotoLightbox(r.fotoPulang,p.nama+' — Pulang '+r.pulang+' ('+r.iso+')')},['📷']));
+    const warna = r.status==='Alpha'?'var(--red)':(r.status==='Terlambat'?'var(--gold)':'inherit');
+    t.appendChild(el('tr',null,[el('td',null,[r.iso]), el('td',null,[r.shift]), cm, cp, el('td',null,[fmtDurasi(r.dm)]), el('td',null,[r.jd?fmtDurasi(r.jd):'—']), el('td',{style:'color:'+warna+';font-weight:600;'},[r.status]), el('td',{style:'color:var(--red);'},[r.catatan])]));
+  });
+  isi.appendChild(el('div',{style:'max-height:50vh;overflow:auto;border:1px solid var(--line);border-radius:8px;'},[t]));
+  isi.appendChild(el('div',{style:'margin-top:10px;text-align:right;'},[el('button',{class:'btn btn-outline btn-sm',onclick:()=>{
+    const data = [['JAM KERJA — '+p.nama],['Rentang: '+startISO+' s/d '+endISO],['Total jam kerja: '+fmtDurasi(totMenit)+' | Hadir '+hariHadir+'/'+hariKerja+' hari kerja'],[],['Tanggal','Shift','Masuk','Pulang','Durasi','Jadwal','Status','Catatan']];
+    baris.forEach(r=>data.push([r.iso,r.shift,r.masuk||'-',r.pulang||'-',r.dm!=null?fmtDurasi(r.dm):'-',r.jd?fmtDurasi(r.jd):'-',r.status,r.catatan]));
+    const ws = XLSX.utils.aoa_to_sheet(data); ws['!cols']=[{wch:12},{wch:16},{wch:9},{wch:9},{wch:10},{wch:10},{wch:12},{wch:60}];
+    const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'Jam Kerja'); XLSX.writeFile(wb, 'Jam-Kerja-'+p.nama.replace(/[^A-Za-z0-9]+/g,'_')+'-'+startISO+'_'+endISO+'.xlsx');
+  }},['💾 Unduh Excel pegawai ini'])]));
 }
 
 function slugify(nama){
@@ -4521,14 +4593,14 @@ function exportJamKedatanganExcel(rows, tanggalLabel, unitLabel){
     ['Tanggal: '+tanggalLabel],
     ['Diunduh: '+new Date().toLocaleString('id-ID')],
     [],
-    ['Tanggal','Nama','Unit','Shift','Jam Masuk','Jam Pulang','Status','Kelengkapan Absen','Catatan Waktu/Lokasi'],
+    ['Tanggal','Nama','Unit','Shift','Jam Masuk','Jam Pulang','Durasi Kerja','Status','Kelengkapan Absen','Catatan Waktu/Lokasi'],
   ];
   rows.forEach(r=>{
     const statusLabel = {cuti:'Cuti', libur:'Libur', ontime:'Tepat Waktu', telat:'Terlambat', alpha:'Belum Absen', '-':'-'}[r.statusMasuk] || r.statusMasuk;
-    data.push([r.tanggal||tanggalLabel, r.nama, r.unit, r.shiftNama, r.jamMasuk||'-', r.jamPulang||'-', statusLabel, [r.tanpaPulang?'Tidak absen pulang':'', r.janggal||''].filter(Boolean).join('; '), r.catatanWaktu||'']);
+    data.push([r.tanggal||tanggalLabel, r.nama, r.unit, r.shiftNama, r.jamMasuk||'-', r.jamPulang||'-', r.durasi!=null?fmtDurasi(r.durasi):'-', statusLabel, [r.tanpaPulang?'Tidak absen pulang':'', r.janggal||''].filter(Boolean).join('; '), r.catatanWaktu||'']);
   });
   const ws = XLSX.utils.aoa_to_sheet(data);
-  ws['!cols'] = [{wch:13},{wch:26},{wch:16},{wch:14},{wch:12},{wch:12},{wch:14},{wch:34},{wch:50}];
+  ws['!cols'] = [{wch:13},{wch:26},{wch:16},{wch:14},{wch:12},{wch:12},{wch:12},{wch:14},{wch:34},{wch:50}];
   ws['!merges'] = [{s:{r:0,c:0},e:{r:0,c:6}},{s:{r:1,c:0},e:{r:1,c:6}},{s:{r:2,c:0},e:{r:2,c:6}},{s:{r:3,c:0},e:{r:3,c:6}}];
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Jam Kedatangan');
@@ -4585,14 +4657,14 @@ function exportRekapAbsensiExcel(rows, periode, unitLabel){
     ['Rentang: '+periode],
     ['Diunduh: '+new Date().toLocaleString('id-ID')],
     [],
-    ['Nama','Unit','Shift','% Hadir','Terlambat (kali)','Alpha (hari)','Tanpa Absen Pulang (hari)','Jam Janggal (hari)','Hari Libur','Hari Cuti','Total Hari Kerja'],
+    ['Nama','Unit','Shift','% Hadir','Terlambat (kali)','Alpha (hari)','Tanpa Absen Pulang (hari)','Jam Janggal (hari)','Total Jam Kerja','Jam Terjadwal','Rata-rata Jam/Hari','Hari Libur','Hari Cuti','Total Hari Kerja'],
   ];
   rows.forEach(r=>{
-    data.push([r.nama, r.unit, r.shiftNama, r.hadir_persen, r.terlambat, r.alpha, r.tanpaPulang||0, r.janggal||0, r.liburHari, r.cutiHari||0, r.totalHari]);
+    data.push([r.nama, r.unit, r.shiftNama, r.hadir_persen, r.terlambat, r.alpha, r.tanpaPulang||0, r.janggal||0, Math.round((r.menitKerja||0)/6)/10, Math.round((r.menitJadwal||0)/6)/10, r.hariDurasi?Math.round(r.menitKerja/r.hariDurasi/6)/10:'', r.liburHari, r.cutiHari||0, r.totalHari]);
   });
   const ws = XLSX.utils.aoa_to_sheet(data);
-  ws['!cols'] = [{wch:26},{wch:16},{wch:16},{wch:10},{wch:14},{wch:12},{wch:16},{wch:14},{wch:11},{wch:11},{wch:16}];
-  ws['!merges'] = [{s:{r:0,c:0},e:{r:0,c:10}},{s:{r:1,c:0},e:{r:1,c:10}},{s:{r:2,c:0},e:{r:2,c:10}},{s:{r:3,c:0},e:{r:3,c:10}}];
+  ws['!cols'] = [{wch:26},{wch:16},{wch:16},{wch:10},{wch:14},{wch:12},{wch:16},{wch:14},{wch:14},{wch:14},{wch:16},{wch:11},{wch:11},{wch:16}];
+  ws['!merges'] = [{s:{r:0,c:0},e:{r:0,c:13}},{s:{r:1,c:0},e:{r:1,c:13}},{s:{r:2,c:0},e:{r:2,c:13}},{s:{r:3,c:0},e:{r:3,c:13}}];
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Rekap Absensi');
   XLSX.writeFile(wb, 'Rekap-Absensi-'+periode.replace(/\s+/g,'')+'.xlsx');
@@ -4642,7 +4714,7 @@ async function renderRekapAbsensi(body){
       return;
     }
     const table = el('table');
-    table.appendChild(el('tr',null,[el('th',null,['Nama']), el('th',null,['Unit']), el('th',null,['Shift']), el('th',null,['Jam Masuk']), el('th',null,['Jam Pulang']), el('th',null,['Status'])]));
+    table.appendChild(el('tr',null,[el('th',null,['Nama']), el('th',null,['Unit']), el('th',null,['Shift']), el('th',null,['Jam Masuk']), el('th',null,['Jam Pulang']), el('th',null,['Durasi']), el('th',null,['Status'])]));
     rows.forEach(r=>{
       let statusBadgeEl;
       if(r.statusMasuk==='cuti') statusBadgeEl = el('span',{class:'chip',style:'background:#E8EEFB;color:#2b5a9e;'},['🏖️ Cuti']);
@@ -4665,6 +4737,7 @@ async function renderRekapAbsensi(body){
       table.appendChild(el('tr',null,[
         el('td',null,[r.nama]), el('td',null,[r.unit]), el('td',null,[r.shiftNama]),
         jamMasukCell, jamPulangCell,
+        el('td',null,[fmtDurasi(r.durasi)]),
         el('td',null,[statusBadgeEl]),
       ]));
     });
@@ -4818,13 +4891,14 @@ async function renderRekapAbsensi(body){
     const table = el('table');
     table.appendChild(el('tr',null,[
       el('th',null,['Nama']),el('th',null,['Unit']),el('th',null,['Shift']),el('th',null,['% Hadir']),
-      el('th',null,['Terlambat']),el('th',null,['Alpha']),el('th',null,['Tanpa Pulang']),el('th',null,['Jam Janggal']),el('th',null,['Libur']),el('th',null,['Cuti']),el('th',null,['Total Hari'])
+      el('th',null,['Terlambat']),el('th',null,['Alpha']),el('th',null,['Tanpa Pulang']),el('th',null,['Jam Janggal']),el('th',null,['Total Jam Kerja']),el('th',null,['Rata-rata/hari']),el('th',null,['Libur']),el('th',null,['Cuti']),el('th',null,['Total Hari'])
     ]));
     rows.forEach(r=>{
       table.appendChild(el('tr',null,[
-        el('td',null,[r.nama]), el('td',null,[r.unit]), el('td',null,[r.shiftNama]),
+        el('td',{style:'cursor:pointer;color:var(--teal);font-weight:600;text-decoration:underline;', title:'Klik untuk melihat jam kerja harian pegawai ini', onclick:()=>bukaJamKerjaPegawai({id:r.id,nama:r.nama,unitId:r.unitId}, dStart.value, dEnd.value)},[r.nama]), el('td',null,[r.unit]), el('td',null,[r.shiftNama]),
         el('td',null,[r.hadir_persen+'%']), el('td',null,[String(r.terlambat)]), el('td',null,[String(r.alpha)]),
         el('td',{style:r.tanpaPulang?'color:var(--red);font-weight:700;':''},[String(r.tanpaPulang||0)]), el('td',{style:r.janggal?'color:var(--red);font-weight:700;':''},[String(r.janggal||0)]),
+        el('td',null,[fmtDurasi(r.menitKerja||0)+(r.menitJadwal?' / '+fmtDurasi(r.menitJadwal):'')]), el('td',null,[r.hariDurasi? fmtDurasi(Math.round(r.menitKerja/r.hariDurasi)) : '—']),
         el('td',null,[String(r.liburHari)]), el('td',null,[String(r.cutiHari||0)]), el('td',null,[String(r.totalHari)]),
       ]));
     });
@@ -4865,7 +4939,7 @@ async function renderRekapAbsensi(body){
       if(doneCount % 5 === 0 || doneCount===staffPool.length){
         progressEl.firstChild.textContent = 'Menghitung rekap untuk '+staffPool.length+' pegawai… ('+doneCount+'/'+staffPool.length+')';
       }
-      return { nama:p.nama, unit:unitName(p.unitId), shiftNama:sum.shiftNama, hadir_persen:sum.hadir_persen, terlambat:sum.terlambat, alpha:sum.alpha, liburHari:sum.liburHari, cutiHari:sum.cutiHari, totalHari:sum.totalHari, tanpaPulang:sum.tanpaPulang, janggal:sum.janggal };
+      return { id:p.id, unitId:p.unitId, menitKerja:sum.menitKerja, hariDurasi:sum.hariDurasi, menitJadwal:sum.menitJadwal, nama:p.nama, unit:unitName(p.unitId), shiftNama:sum.shiftNama, hadir_persen:sum.hadir_persen, terlambat:sum.terlambat, alpha:sum.alpha, liburHari:sum.liburHari, cutiHari:sum.cutiHari, totalHari:sum.totalHari, tanpaPulang:sum.tanpaPulang, janggal:sum.janggal };
     });
     lastRows = rows;
     rekapSearchInp.value = '';
