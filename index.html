@@ -1801,7 +1801,9 @@ async function sinkronAbsensiPenilaian(opts){
     const toSave = [];
     for(const p of grp){
       const pn = getPenilaian(periode, p.id);
-      if(ABSEN_AUTO_BEKU.includes(pn.status)){ hasil.beku++; continue; }
+      const beku = ABSEN_AUTO_BEKU.includes(pn.status);
+      if(opts.mode==='terkunci'){ if(!beku) continue; }   // hitung ulang khusus penilaian terkunci (Super Admin)
+      else if(beku){ hasil.beku++; continue; }
       if(pn.absensi_manual && !opts.timpaManual){ hasil.manual++; continue; }
       if(state.modal && state.modal.pegawaiId===p.id){ continue; } // sedang dibuka di layar edit — jangan diubah diam-diam
       const sum = await computeAttendanceSummary(p.id, r.start, r.end, logsMap);
@@ -1809,7 +1811,18 @@ async function sinkronAbsensiPenilaian(opts){
       const lama = pn.absensi || {};
       const sama = lama.hadir_persen===sum.hadir_persen && lama.terlambat===sum.terlambat && lama.alpha===sum.alpha;
       const infoLama = pn.absensi_auto;
-      pn.absensi = { hadir_persen:sum.hadir_persen, terlambat:sum.terlambat, alpha:sum.alpha, sp_aktif: lama.sp_aktif||0 };
+      const baru = { hadir_persen:sum.hadir_persen, terlambat:sum.terlambat, alpha:sum.alpha, sp_aktif: lama.sp_aktif||0 };
+      if(opts.dryRun){   // hanya pratinjau dampak — tidak mengubah apa pun
+        const f0 = computeFinal(pn, p.unitId), f1 = computeFinal({...pn, absensi: baru}, p.unitId);
+        const nom = (f)=> pn.status==='FINAL' ? Math.round(Number(p.tukin_maks||0)*f.tier.persen/100) : 0;
+        hasil.daftar = hasil.daftar || [];
+        hasil.daftar.push({ id:p.id, nama:p.nama, unit:unitName(p.unitId), status:pn.status, lama:{...lama}, baru,
+          persenLama:f0.tier.persen, persenBaru:f1.tier.persen, nomLama:nom(f0), nomBaru:nom(f1),
+          auto:{ dari:r.start, sampai:r.end, hariKerja:sum.totalHari, hadir:sum.hadirHari, cuti:sum.cutiHari, libur:sum.liburHari, tanpaPulang:sum.tanpaPulang, janggal:sum.janggal, penuh:r.penuh } });
+        if(sama) hasil.sama++; else hasil.diperbarui++;
+        continue;
+      }
+      pn.absensi = baru;
       pn.absensi_manual = false;
       pn.absensi_auto = { dari:r.start, sampai:r.end, hariKerja:sum.totalHari, hadir:sum.hadirHari, cuti:sum.cutiHari, libur:sum.liburHari, tanpaPulang:sum.tanpaPulang, janggal:sum.janggal, penuh:r.penuh };
       hasil.tanpaPulang = (hasil.tanpaPulang||0) + sum.tanpaPulang; hasil.janggal = (hasil.janggal||0) + sum.janggal;
@@ -1842,6 +1855,9 @@ function paintAbsenSyncBanner(){
   box.appendChild(el('div',{style:'flex:1;min-width:220px;font-size:12px;'},[msg]));
   if(!st.running){
     box.style.background = bg; box.style.color = col;
+    if(st.hasil && (st.hasil.janggal||st.hasil.tanpaPulang)){
+      box.appendChild(el('button',{class:'btn btn-outline btn-sm', onclick:()=>{ state.janggalRange = {start:st.hasil.dari, end:st.hasil.sampai}; state.tab='rekap_absensi'; rerender(); }},['🔎 Lihat yang janggal']));
+    }
     box.appendChild(el('button',{class:'btn btn-outline btn-sm', onclick:()=>{ jalankanSinkronAbsen(st.list, st.key, false); }},['🔄 Hitung ulang']));
     if((state.role==='admin'||state.role==='hrd') && st.hasil && st.hasil.manual){
       box.appendChild(el('button',{class:'btn btn-outline btn-sm', title:'Hitung ulang SEMUA, termasuk yang diisi manual', onclick:()=>{
@@ -1870,6 +1886,169 @@ function absenSyncBanner(body, list, key){
   const segar = st && st.periode===state.periode && (st.key===key || st.key==='all') && (st.running || (Date.now()-st.at) < 10*60000);
   if(segar){ paintAbsenSyncBanner(); }
   else if(list.length>0){ jalankanSinkronAbsen(list, key, false); }
+}
+
+/* ============ HITUNG ULANG TUKIN DARI KEHADIRAN (khusus Super Admin) ============
+ * Penilaian yang sudah divalidasi/Final terkunci. Fitur ini menampilkan dulu DAMPAK-nya (siapa berubah, tukin lama → baru,
+ * total selisih), meminta alasan tertulis, lalu menerapkan dan mencatat riwayatnya di tiap penilaian (tidak bisa dihapus). */
+function fmtRp(n){ return 'Rp '+Math.round(n||0).toLocaleString('id-ID'); }
+async function bukaHitungUlangTukin(){
+  if(state.role!=='admin') return;
+  if(!state.superAdminPin){ alert('PIN Super Admin belum diatur — atur dulu di Pengaturan Bobot → Keamanan Admin.'); return; }
+  const pin = prompt('Fitur ini mengubah angka tukin yang sudah Final dan khusus Super Admin.\nMasukkan PIN Super Admin:');
+  if(pin===null) return;
+  if(pin !== state.superAdminPin){ alert('PIN Super Admin salah.'); return; }
+  const periode = state.periode;
+  const overlay = el('div',{style:'position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:9998;display:flex;align-items:center;justify-content:center;padding:16px;'});
+  const card = el('div',{style:'background:#fff;border-radius:14px;padding:20px;max-width:980px;width:100%;max-height:90vh;overflow:auto;'});
+  overlay.appendChild(card); document.body.appendChild(overlay);
+  card.appendChild(el('h3',{style:'margin:0 0 6px;'},['🔓 Hitung Ulang Tukin dari Kehadiran — '+periode]));
+  const isi = el('div'); card.appendChild(isi);
+  isi.appendChild(el('div',{class:'small-note'},['⏳ Menghitung dampak untuk penilaian yang sudah divalidasi/Final… (belum ada yang diubah)']));
+  const tutup = ()=>{ if(overlay.parentNode) overlay.parentNode.removeChild(overlay); };
+  let hasil;
+  try{ hasil = await sinkronAbsensiPenilaian({ periode, pegawai:state.pegawai, mode:'terkunci', dryRun:true }); }
+  catch(e){ isi.innerHTML=''; isi.appendChild(el('div',{class:'warn-note'},['Gagal menghitung: '+(e.message||e)])); isi.appendChild(el('button',{class:'btn btn-outline',onclick:tutup},['Tutup'])); return; }
+  isi.innerHTML = '';
+  if(hasil.error){ isi.appendChild(el('div',{class:'warn-note'},[hasil.error])); isi.appendChild(el('button',{class:'btn btn-outline',style:'margin-top:10px;',onclick:tutup},['Tutup'])); return; }
+  const daftar = hasil.daftar || [];
+  const berubah = daftar.filter(d=> d.lama.hadir_persen!==d.baru.hadir_persen || d.lama.terlambat!==d.baru.terlambat || d.lama.alpha!==d.baru.alpha);
+  const tukinBerubah = berubah.filter(d=>d.nomLama!==d.nomBaru);
+  const totLama = daftar.reduce((a,d)=>a+d.nomLama,0), totBaru = daftar.reduce((a,d)=>a+d.nomBaru,0);
+  isi.appendChild(el('div',{style:'font-size:13px;line-height:1.6;margin-bottom:10px;'},[
+    'Rentang kehadiran dihitung: '+hasil.dari+' s/d '+hasil.sampai+(hasil.penuh?'':' (periode masih berjalan — hari ini belum dihitung)')+'. ',
+    el('b',null,[String(daftar.length)]), ' penilaian terkunci diperiksa; ', el('b',null,[String(berubah.length)]), ' angka absensinya akan berubah; ',
+    el('b',null,[String(tukinBerubah.length)]), ' di antaranya mengubah nominal tukin. Total tukin Final: ',
+    el('b',null,[fmtRp(totLama)]), ' → ', el('b',{style:'color:'+(totBaru<totLama?'var(--red)':'var(--green)')+';'},[fmtRp(totBaru)]), ' (selisih '+fmtRp(totBaru-totLama)+').'+
+    (hasil.manual?' '+hasil.manual+' pegawai diisi manual (dilewati).':'')+(hasil.tanpaData?' '+hasil.tanpaData+' pegawai tanpa data Absen Mandiri (dilewati).':'')]));
+  isi.appendChild(el('div',{class:'warn-note',style:'margin-bottom:10px;'},['Ini mengubah tukin yang sudah disahkan. Gunakan hanya bila tukin periode ini belum dicairkan atau memang perlu dikoreksi. Perubahan dicatat (waktu, alasan, angka lama/baru) di tiap penilaian dan tidak dapat dihapus.']));
+  if(berubah.length>0){
+    const tbl = el('table',{style:'font-size:12px;'});
+    tbl.appendChild(el('tr',null,['Nama','Unit','Hadir %','Terlambat','Alpha','% Tukin','Nominal Tukin'].map(h=>el('th',null,[h]))));
+    berubah.slice(0,150).forEach(d=>{
+      tbl.appendChild(el('tr',null,[
+        el('td',null,[d.nama]), el('td',null,[d.unit]),
+        el('td',null,[d.lama.hadir_persen+' → '+d.baru.hadir_persen]), el('td',null,[d.lama.terlambat+' → '+d.baru.terlambat]), el('td',null,[d.lama.alpha+' → '+d.baru.alpha]),
+        el('td',null,[d.persenLama+'% → '+d.persenBaru+'%']), el('td',null,[d.status==='FINAL' ? fmtRp(d.nomLama)+' → '+fmtRp(d.nomBaru) : '—']),
+      ]));
+    });
+    card.appendChild(el('div',{style:'max-height:38vh;overflow:auto;border:1px solid var(--line);border-radius:8px;margin-bottom:10px;'},[tbl]));
+    if(berubah.length>150) card.appendChild(el('div',{class:'small-note'},['Menampilkan 150 pertama dari '+berubah.length+' — daftar lengkap ada di unduhan Excel.']));
+  } else {
+    isi.appendChild(el('div',{class:'small-note'},['Tidak ada angka absensi yang berubah — tukin tetap sama.']));
+  }
+  const alasan = el('textarea',{rows:'2',placeholder:'Alasan wajib diisi (mis. "Penerapan aturan absen pulang sesuai SK Direktur no. …")',style:'width:100%;margin-top:6px;'});
+  if(berubah.length>0) card.appendChild(el('div',{class:'field'},[el('label',null,['Alasan hitung ulang']), alasan]));
+  const aksi = el('div',{style:'display:flex;gap:8px;justify-content:flex-end;margin-top:12px;flex-wrap:wrap;'});
+  aksi.appendChild(el('button',{class:'btn btn-outline',onclick:tutup},['Batal']));
+  if(berubah.length>0){
+    aksi.appendChild(el('button',{class:'btn btn-outline',onclick:()=>{
+      const data = [['PERUBAHAN TUKIN AKIBAT HITUNG ULANG KEHADIRAN — '+periode],['Rentang: '+hasil.dari+' s/d '+hasil.sampai],[],
+        ['Nama','Unit','Status','Hadir % lama','Hadir % baru','Terlambat lama','Terlambat baru','Alpha lama','Alpha baru','% Tukin lama','% Tukin baru','Nominal lama','Nominal baru','Selisih']];
+      berubah.forEach(d=>data.push([d.nama,d.unit,d.status,d.lama.hadir_persen,d.baru.hadir_persen,d.lama.terlambat,d.baru.terlambat,d.lama.alpha,d.baru.alpha,d.persenLama,d.persenBaru,d.nomLama,d.nomBaru,d.nomBaru-d.nomLama]));
+      const ws = XLSX.utils.aoa_to_sheet(data); const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'Perubahan');
+      XLSX.writeFile(wb, 'Perubahan-Tukin-'+periode.replace(/\s+/g,'')+'.xlsx');
+    }},['💾 Unduh daftar (Excel)']));
+    const btnTerap = el('button',{class:'btn btn-red',onclick: async ()=>{
+      if(alasan.value.trim().length<10){ alert('Isi alasan hitung ulang (minimal 10 karakter).'); return; }
+      if(!confirm('Terapkan perubahan ke '+berubah.length+' penilaian ('+tukinBerubah.length+' berubah nominal tukinnya)?\n\nTindakan ini dicatat dan tidak bisa dibatalkan otomatis.')) return;
+      btnTerap.disabled = true; btnTerap.textContent = 'Menerapkan…';
+      try{
+        const pada = new Date(trustedNowMs()).toISOString();
+        berubah.forEach(d=>{
+          const pn = getPenilaian(periode, d.id);
+          pn.absensi = {...d.baru}; pn.absensi_manual = false; pn.absensi_auto = d.auto;
+          pn.riwayat_hitung_ulang = (pn.riwayat_hitung_ulang||[]).concat([{ pada, oleh:'Super Admin', alasan:alasan.value.trim(), lama:d.lama, baru:d.baru, persenLama:d.persenLama, persenBaru:d.persenBaru, nomLama:d.nomLama, nomBaru:d.nomBaru }]);
+        });
+        await mapLimit(berubah, 8, async d=>{ await savePenilaian(periode, d.id); });
+        tutup(); rerender();
+        alert('✓ '+berubah.length+' penilaian dihitung ulang. Perubahan tercatat di riwayat tiap penilaian.');
+      }catch(e){ alert('❌ Gagal menerapkan: '+(e.message||e)); btnTerap.disabled=false; btnTerap.textContent='Terapkan Perubahan'; }
+    }},['Terapkan Perubahan']);
+    aksi.appendChild(btnTerap);
+  }
+  card.appendChild(aksi);
+}
+
+/* ============ DAFTAR ABSEN JANGGAL / TIDAK LENGKAP ============ */
+function renderPanelJanggal(body, staffPool, isUnitRole){
+  const panel = el('div',{class:'panel',id:'panel-janggal',style:'border-color:var(--red);'});
+  panel.appendChild(el('h3',null,['🔎 Daftar Absen Janggal / Tidak Lengkap'+(isUnitRole?' — '+unitName(state.currentUnitId):' — Semua Unit')]));
+  panel.appendChild(el('div',{class:'small-note',style:'margin-bottom:10px;'},['Menampilkan setiap hari yang bermasalah: (1) Absen Masuk tanpa Absen Pulang, (2) jam pulang lebih awal dari jam masuk atau selisihnya terlalu singkat, (3) jam HP tidak sinkron dengan server / lokasi mencurigakan. Klik 📷 untuk melihat foto selfie dan membandingkan.']));
+  const pre = state.janggalRange || periodeKeRentang(state.periode) || {start:todayISO().slice(0,8)+'01', end:todayISO()};
+  state.janggalRange = null;
+  const dS = el('input',{type:'date',value:pre.start}), dE = el('input',{type:'date',value:pre.end});
+  const selJenis = el('select',{style:'padding:7px 9px;border:1px solid var(--line);border-radius:7px;'});
+  [['semua','Semua masalah'],['tp','Tanpa absen pulang'],['jg','Jam janggal (terbalik/terlalu singkat)'],['wk','Jam HP tidak sinkron / lokasi']].forEach(([v,l])=>selJenis.appendChild(el('option',{value:v},[l])));
+  const btnGo = el('button',{class:'btn btn-primary btn-sm'},['🔎 Tampilkan']);
+  const btnXls = el('button',{class:'btn btn-outline btn-sm',style:'display:none;'},['💾 Unduh Excel']);
+  panel.appendChild(el('div',{style:'display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px;'},[
+    el('span',{style:'font-size:12px;color:var(--ink-soft);'},['Rentang:']), dS, el('span',{style:'font-size:12px;'},['s/d']), dE, selJenis, btnGo, btnXls]));
+  const cari = el('input',{type:'text',placeholder:'🔍 Cari nama pegawai…',style:'width:100%;margin-bottom:10px;'});
+  const info = el('div',{class:'small-note',style:'margin-bottom:8px;'});
+  const hasilBox = el('div');
+  panel.appendChild(cari); panel.appendChild(info); panel.appendChild(hasilBox);
+  body.appendChild(panel);
+  let semuaBaris = null;
+  function tampil(){
+    hasilBox.innerHTML = '';
+    if(!semuaBaris) return;
+    const q = cari.value.trim().toLowerCase(), j = selJenis.value;
+    const rows = semuaBaris.filter(r=>(!q || r.nama.toLowerCase().includes(q)) && (j==='semua' || r.jenis.includes(j)));
+    info.textContent = rows.length+' hari bermasalah ditampilkan dari '+semuaBaris.length+' ('+semuaBaris.filter(r=>r.jenis.includes('tp')).length+' tanpa pulang · '+semuaBaris.filter(r=>r.jenis.includes('jg')).length+' jam janggal · '+semuaBaris.filter(r=>r.jenis.includes('wk')).length+' jam HP/lokasi).';
+    if(rows.length===0){ hasilBox.appendChild(el('div',{class:'empty'},['Tidak ada yang cocok.'])); return; }
+    const t = el('table',{style:'font-size:12.5px;'});
+    t.appendChild(el('tr',null,['Tanggal','Nama','Unit','Shift','Masuk','Pulang','Masalah'].map(h=>el('th',null,[h]))));
+    rows.slice(0,1000).forEach(r=>{
+      const cm = el('td',{style:'font-weight:700;'},[r.jamMasuk||'—']);
+      if(r.fotoMasuk) cm.appendChild(el('button',{class:'btn btn-outline btn-sm',style:'margin-left:6px;padding:2px 7px;',onclick:()=>showPhotoLightbox(r.fotoMasuk, r.nama+' — Masuk '+r.jamMasuk+' ('+r.tanggal+')')},['📷']));
+      const cp = el('td',{style:'font-weight:700;'},[r.jamPulang||'—']);
+      if(r.fotoPulang) cp.appendChild(el('button',{class:'btn btn-outline btn-sm',style:'margin-left:6px;padding:2px 7px;',onclick:()=>showPhotoLightbox(r.fotoPulang, r.nama+' — Pulang '+r.jamPulang+' ('+r.tanggal+')')},['📷']));
+      t.appendChild(el('tr',null,[el('td',null,[r.tanggal]), el('td',null,[r.nama]), el('td',null,[r.unit]), el('td',null,[r.shiftNama]), cm, cp,
+        el('td',{style:'color:var(--red);'},[r.alasan])]));
+    });
+    hasilBox.appendChild(t);
+    if(rows.length>1000) hasilBox.appendChild(el('div',{class:'small-note'},['Menampilkan 1000 pertama — unduh Excel untuk semuanya.']));
+  }
+  cari.addEventListener('input', tampil); selJenis.addEventListener('change', tampil);
+  async function muat(){
+    btnGo.disabled = true; btnXls.style.display='none'; hasilBox.innerHTML=''; semuaBaris = null;
+    const dates = []; for(let d=new Date(dS.value+'T00:00:00'); d<=new Date(dE.value+'T00:00:00'); d.setDate(d.getDate()+1)){ dates.push(d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')); }
+    if(dates.length===0 || dates.length>62){ info.textContent='Pilih rentang 1–62 hari.'; btnGo.disabled=false; return; }
+    const rows = [];
+    try{
+      for(let i=0;i<staffPool.length;i+=30){
+        info.textContent = '⏳ Memeriksa absensi… '+Math.min(i+30,staffPool.length)+' / '+staffPool.length+' pegawai';
+        const grp = staffPool.slice(i,i+30);
+        const lm = await getAbsensiLogsMulti(grp.map(p=>p.id), dates);
+        for(const p of grp){
+          for(const iso of dates){
+            const log = lm['absensi-log:'+p.id+':'+iso]; if(!log || !log.masuk) continue;
+            const shift = await getShiftForDate(p.id, iso);
+            const cek = cekLogHarian(log, shift, iso); const wk = waktuCatatan(log);
+            if(!cek.tanpaPulang && !cek.janggal && !wk) continue;
+            const jenis = [], alasan = [];
+            if(cek.tanpaPulang){ jenis.push('tp'); alasan.push('Tidak absen pulang'); }
+            if(cek.janggal){ jenis.push('jg'); alasan.push(cek.janggal); }
+            if(wk){ jenis.push('wk'); alasan.push(wk); }
+            rows.push({ tanggal:iso, nama:p.nama, unit:unitName(p.unitId), shiftNama: shift.nama||'-', jamMasuk:log.masuk.jam, jamPulang:log.pulang?log.pulang.jam:null, fotoMasuk:log.masuk.foto||null, fotoPulang:log.pulang?log.pulang.foto:null, jenis, alasan:alasan.join(' · ') });
+          }
+        }
+      }
+      rows.sort((a,b)=> a.nama.localeCompare(b.nama) || a.tanggal.localeCompare(b.tanggal));
+      semuaBaris = rows; btnXls.style.display=''; tampil();
+    }catch(e){ info.textContent = '❌ Gagal memeriksa: '+(e.message||e); }
+    btnGo.disabled = false;
+  }
+  btnGo.addEventListener('click', muat);
+  btnXls.addEventListener('click', ()=>{
+    if(!semuaBaris) return;
+    const data = [['DAFTAR ABSEN JANGGAL / TIDAK LENGKAP — RSU ALLAM MEDICA'],['Rentang: '+dS.value+' s/d '+dE.value],[],['Tanggal','Nama','Unit','Shift','Jam Masuk','Jam Pulang','Masalah']];
+    semuaBaris.forEach(r=>data.push([r.tanggal,r.nama,r.unit,r.shiftNama,r.jamMasuk||'-',r.jamPulang||'-',r.alasan]));
+    const ws = XLSX.utils.aoa_to_sheet(data); ws['!cols']=[{wch:12},{wch:28},{wch:18},{wch:16},{wch:10},{wch:10},{wch:70}];
+    const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'Absen Janggal'); XLSX.writeFile(wb, 'Absen-Janggal-'+dS.value+'_'+dE.value+'.xlsx');
+  });
+  if(pre.start && pre.end && state._autoJanggal!==false){ setTimeout(()=>{ muat(); panel.scrollIntoView({behavior:'smooth',block:'start'}); }, 50); }
 }
 
 function slugify(nama){
@@ -4627,6 +4806,7 @@ async function renderRekapAbsensi(body){
   const resultBox = el('div',{id:'rekap-absensi-result'});
   panel.appendChild(resultBox);
   body.appendChild(panel);
+  { const dariBanner = !!state.janggalRange; state._autoJanggal = dariBanner; renderPanelJanggal(body, staffPool, isUnitRole); }
 
   let lastRows = null;
   function renderRekapTable(rows){
@@ -5519,6 +5699,9 @@ function renderRekap(body){
   const headRow = el('div',{class:'no-print',style:'display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:14px;'});
   headRow.appendChild(el('h3',{style:'margin:0;'},['Rekap Penilaian & Tukin — Periode '+state.periode]));
   const btnRow = el('div',{style:'display:flex;gap:8px;'});
+  if(state.role==='admin'){
+    btnRow.appendChild(el('button',{class:'btn btn-outline btn-sm',style:'border-color:var(--red);color:var(--red);', title:'Hitung ulang tukin yang sudah Final berdasarkan data kehadiran terbaru (khusus Super Admin, ada pratinjau dampak)', onclick:()=>{ bukaHitungUlangTukin(); }},['🔓 Hitung Ulang Tukin dari Kehadiran']));
+  }
   btnRow.appendChild(el('button',{class:'btn btn-outline btn-sm', onclick:()=>{ exportRekapExcel(finalsFiltered, state.periode); }},['💾 Unduh Excel']));
   btnRow.appendChild(el('button',{class:'btn btn-outline btn-sm', title:'Unduh laporan penilaian tiap pegawai (bisa diedit) dalam 1 file Word — untuk bukti akreditasi', onclick:()=>{ downloadLaporanMassal(finalsFiltered, state.periode); }},['📄 Unduh Laporan Word (Massal)']));
   btnRow.appendChild(el('button',{class:'btn btn-gold btn-sm', onclick:()=>{ window.print(); }},['🖨️ Cetak']));
@@ -6183,7 +6366,9 @@ function buildInputPenilaianModal(modal){
   { const ai = pn.absensi_auto;
     if(pn.absensi_manual) modal.appendChild(el('div',{class:'small-note',style:'margin-bottom:8px;color:var(--gold);'},['✏️ Angka absensi diisi manual — tidak ditimpa hitungan otomatis.']));
     else if(ai) modal.appendChild(el('div',{class:'small-note',style:'margin-bottom:8px;color:var(--teal);'},['✓ Terisi otomatis dari Absen Mandiri ('+ai.dari+' s/d '+ai.sampai+'): '+ai.hadir+' hadir dari '+ai.hariKerja+' hari kerja'+(ai.cuti?', '+ai.cuti+' hari cuti tidak dihitung':'')+(ai.tanpaPulang?' · ⚠️ '+ai.tanpaPulang+' hari tanpa absen pulang':'')+(ai.janggal?' · ⚠️ '+ai.janggal+' hari jam janggal':'')+'.']));
-    else modal.appendChild(el('div',{class:'small-note',style:'margin-bottom:8px;'},['Belum ada data Absen Mandiri untuk periode ini — isi manual, atau tekan tombol di bawah bila datanya sudah ada.'])); }
+    else modal.appendChild(el('div',{class:'small-note',style:'margin-bottom:8px;'},['Belum ada data Absen Mandiri untuk periode ini — isi manual, atau tekan tombol di bawah bila datanya sudah ada.']));
+    if(pn.riwayat_hitung_ulang && pn.riwayat_hitung_ulang.length){ const rh = pn.riwayat_hitung_ulang[pn.riwayat_hitung_ulang.length-1];
+      modal.appendChild(el('div',{class:'small-note',style:'margin-bottom:8px;color:var(--gold);'},['🔁 Dihitung ulang oleh '+rh.oleh+' ('+new Date(rh.pada).toLocaleDateString('id-ID')+'): '+rh.alasan+' — absensi '+rh.lama.hadir_persen+'%/'+rh.lama.terlambat+'x/'+rh.lama.alpha+' alpha → '+rh.baru.hadir_persen+'%/'+rh.baru.terlambat+'x/'+rh.baru.alpha+' alpha.'])); } }
 
   if(editable){
     const pullRow = el('div',{style:'display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px;'});
