@@ -742,6 +742,7 @@ let state = {
   hrdPin: '', hrdAuthed: false, hrdLoginError: null, hrdPinEditing: false,
   geofence: { lat:null, lng:null, radius:200 }, // titik referensi RS + radius (meter) untuk absen GPS
   shiftConfig: { jamMulai:'07:00', toleransiMenit:15 }, // default cadangan untuk pegawai tanpa shift terpilih
+  aturanAbsen: { tanpaPulang:'tandai', minDurasiMenit:30 }, // tanpaPulang: 'tandai' (tetap hadir, ditandai) | 'alpha' (dihitung tidak hadir)
   shiftDefs: [
     {key:'pagi', nama:'Pagi', jamMulai:'07:00', jamSelesai:'14:00', toleransiMenit:15},
     {key:'siang', nama:'Siang', jamMulai:'14:00', jamSelesai:'21:00', toleransiMenit:15},
@@ -877,6 +878,7 @@ function loadFromLocalCache(){
     state.hrdPin = c.hrdPin || '';
     state.geofence = c.geofence || state.geofence;
     state.shiftConfig = c.shiftConfig || state.shiftConfig;
+    state.aturanAbsen = Object.assign({tanpaPulang:'tandai', minDurasiMenit:30}, c.aturanAbsen||{});
     state.shiftDefs = (c.shiftDefs && c.shiftDefs.length) ? c.shiftDefs : state.shiftDefs;
     state.penilaian = c.penilaian || {};
     if(state.units.length>0 && !state.currentUnitId) state.currentUnitId = state.units[0].id;
@@ -890,7 +892,7 @@ function saveToLocalCache(){
       weight: state.weight, subWeight: state.subWeight, tiers: state.tiers, perUnitWeight: state.perUnitWeight,
       aspekConfig: state.aspekConfig, sikapThresholds: state.sikapThresholds,
       adminPin: state.adminPin, superAdminPin: state.superAdminPin, hrdPin: state.hrdPin,
-      geofence: state.geofence, shiftConfig: state.shiftConfig, shiftDefs: state.shiftDefs,
+      geofence: state.geofence, shiftConfig: state.shiftConfig, shiftDefs: state.shiftDefs, aturanAbsen: state.aturanAbsen,
       penilaian: state.penilaian,
     }));
   }catch(e){}
@@ -987,7 +989,7 @@ async function loadAll(){
     (async ()=>{
       try{
         const gf = await Storage.get('absensi-config', true);
-        if(gf){ const parsed = JSON.parse(gf.value); state.geofence = parsed.geofence || state.geofence; state.shiftConfig = parsed.shiftConfig || state.shiftConfig; state.shiftDefs = parsed.shiftDefs || state.shiftDefs; }
+        if(gf){ const parsed = JSON.parse(gf.value); state.geofence = parsed.geofence || state.geofence; state.shiftConfig = parsed.shiftConfig || state.shiftConfig; state.shiftDefs = parsed.shiftDefs || state.shiftDefs; state.aturanAbsen = Object.assign({tanpaPulang:'tandai', minDurasiMenit:30}, parsed.aturanAbsen||{}); }
       }catch(e){}
     })(),
   ]);
@@ -1149,7 +1151,7 @@ async function saveAdminSecurity(){
   return queuedSave('admin-security', ()=>Storage.set('admin-security', JSON.stringify({pin: state.adminPin, superPin: state.superAdminPin, hrdPin: state.hrdPin}), true));
 }
 async function saveAbsensiConfig(){
-  return queuedSave('absensi-config', ()=>Storage.set('absensi-config', JSON.stringify({geofence: state.geofence, shiftConfig: state.shiftConfig, shiftDefs: state.shiftDefs}), true));
+  return queuedSave('absensi-config', ()=>Storage.set('absensi-config', JSON.stringify({geofence: state.geofence, shiftConfig: state.shiftConfig, shiftDefs: state.shiftDefs, aturanAbsen: state.aturanAbsen}), true));
 }
 
 /* ============ ABSEN MANDIRI: GPS + SIDIK JARI (WebAuthn) ============ */
@@ -1546,6 +1548,15 @@ async function buildAbsenEntry(pegawaiId, jenis, foto){ // jenis: 'masuk' | 'pul
   if(log[jenis]){
     throw new Error('Absen '+(jenis==='masuk'?'Masuk':'Pulang')+' untuk sesi ini SUDAH tercatat pukul '+log[jenis].jam+' dan terkunci — tidak bisa ditimpa lagi.');
   }
+  if(jenis==='pulang' && log.masuk){
+    const minDur = (state.aturanAbsen && state.aturanAbsen.minDurasiMenit) || 0;
+    const nw = fmtWaktuRS(trustedNowMs());
+    const selisihHari = Math.round((Date.UTC(+nw.date.slice(0,4), +nw.date.slice(5,7)-1, +nw.date.slice(8,10)) - Date.UTC(+dateISO.slice(0,4), +dateISO.slice(5,7)-1, +dateISO.slice(8,10)))/86400000);
+    const sudahMenit = selisihHari*1440 + jamKeMenit(nw.time) - jamKeMenit(log.masuk.jam);
+    if(sudahMenit < minDur){
+      throw new Error('Absen Pulang baru bisa dilakukan minimal '+minDur+' menit setelah Absen Masuk (Absen Masuk tercatat pukul '+log.masuk.jam+'). Jika Anda salah menekan Absen Masuk, hubungi HRD untuk koreksi.');
+    }
+  }
   await syncWaktuServer(30000); // segarkan lagi kalau proses verifikasi memakan waktu lama
   const nowMs = trustedNowMs();
   const jam = fmtWaktuRS(nowMs).time;          // jam resmi = jam server (WIB), BUKAN jam HP
@@ -1683,9 +1694,34 @@ async function scanSuspiciousLogs(pegawaiId, startISO, endISO){
   return results.flat();
 }
 
+function jamKeMenit(h){ const a = String(h||'0:0').split(':').map(Number); return (a[0]||0)*60+(a[1]||0); }
+/** Periksa kelengkapan & kewajaran absen satu hari: (1) ada Absen Masuk tapi tidak ada Absen Pulang pada hari yang sudah lewat,
+ * (2) jam pulang lebih awal dari jam masuk (di luar shift malam) atau selisihnya terlalu pendek (salah tekan/jam HP kacau). */
+function cekLogHarian(log, shift, dateISO){
+  const out = { tanpaPulang:false, janggal:null };
+  if(!log || !log.masuk) return out;
+  const overnight = !!(shift && shift.jamMulai && shift.jamSelesai && jamKeMenit(shift.jamSelesai) <= jamKeMenit(shift.jamMulai));
+  if(!log.pulang){
+    if(dateISO < todayISO()){
+      // sesi shift malam kemarin masih sah berjalan sampai menjelang siang hari ini — belum dianggap lupa absen pulang
+      const nowMin = jamKeMenit(fmtWaktuRS(trustedNowMs()).time);
+      if(!(dateISO===isoDateOffset(-1) && overnight && nowMin < 12*60)) out.tanpaPulang = true;
+    }
+    return out;
+  }
+  const m = jamKeMenit(log.masuk.jam), pu = jamKeMenit(log.pulang.jam);
+  const dur = overnight ? (((pu-m)%1440)+1440)%1440 : (pu-m);
+  if(!overnight && pu < m) out.janggal = 'Jam pulang ('+log.pulang.jam+') lebih awal dari jam masuk ('+log.masuk.jam+')';
+  else if(dur < ((state.aturanAbsen&&state.aturanAbsen.minDurasiMenit)||30)) out.janggal = 'Selisih masuk–pulang hanya '+dur+' menit ('+log.masuk.jam+' → '+log.pulang.jam+')';
+  return out;
+}
+function cekFieldsRow(log, shift, dateISO){
+  if(shift && (shift.cuti||shift.libur) && !(log&&log.masuk)) return {tanpaPulang:false, janggal:null};
+  const c = cekLogHarian(log, shift, dateISO); return { tanpaPulang:c.tanpaPulang, janggal:c.janggal };
+}
 async function computeAttendanceSummary(pegawaiId, startISO, endISO, logsMap){
   const start = new Date(startISO), end = new Date(endISO);
-  let totalHari=0, hadirHari=0, terlambatHari=0, alphaHari=0, liburHari=0, cutiHari=0;
+  let totalHari=0, hadirHari=0, terlambatHari=0, alphaHari=0, liburHari=0, cutiHari=0, tanpaPulangHari=0, janggalHari=0;
   const shiftNamaTerpakai = new Set();
   for(let d=new Date(start); d<=end; d.setDate(d.getDate()+1)){
     const iso = d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
@@ -1698,17 +1734,24 @@ async function computeAttendanceSummary(pegawaiId, startISO, endISO, logsMap){
     // Kalau sudah ada peta log hasil pengambilan massal (getAbsensiLogsMulti), pakai itu — jangan minta ke server lagi satu-satu.
     const log = logsMap ? (logsMap['absensi-log:'+pegawaiId+':'+iso] || {}) : await getAbsensiLog(pegawaiId, iso);
     if(log.masuk){
-      hadirHari++;
-      const [jamH, menitH] = shift.jamMulai.split(':').map(Number);
-      const [jm, mm] = log.masuk.jam.split(':').map(Number);
-      const menitMasuk = jm*60+mm, menitBatas = jamH*60+menitH+shift.toleransiMenit;
-      if(menitMasuk > menitBatas) terlambatHari++;
+      const cek = cekLogHarian(log, shift, iso);
+      if(cek.tanpaPulang) tanpaPulangHari++;
+      if(cek.janggal) janggalHari++;
+      if(cek.tanpaPulang && state.aturanAbsen.tanpaPulang==='alpha'){
+        alphaHari++; // kebijakan RS: tidak absen pulang = tidak dihitung hadir
+      } else {
+        hadirHari++;
+        const [jamH, menitH] = shift.jamMulai.split(':').map(Number);
+        const [jm, mm] = log.masuk.jam.split(':').map(Number);
+        const menitMasuk = jm*60+mm, menitBatas = jamH*60+menitH+shift.toleransiMenit;
+        if(menitMasuk > menitBatas) terlambatHari++;
+      }
     } else {
       alphaHari++;
     }
   }
   const hadir_persen = totalHari>0 ? Math.round((hadirHari/totalHari)*1000)/10 : 100;
-  return { hadir_persen, terlambat:terlambatHari, alpha:alphaHari, totalHari, hadirHari, liburHari, cutiHari, shiftNama: [...shiftNamaTerpakai].join(', ')||'Default' };
+  return { hadir_persen, terlambat:terlambatHari, alpha:alphaHari, totalHari, hadirHari, liburHari, cutiHari, tanpaPulang:tanpaPulangHari, janggal:janggalHari, shiftNama: [...shiftNamaTerpakai].join(', ')||'Default' };
 }
 
 /* ============ ABSENSI OTOMATIS UNTUK PENILAIAN SIKAP KERJA ============
@@ -1762,13 +1805,14 @@ async function sinkronAbsensiPenilaian(opts){
       if(pn.absensi_manual && !opts.timpaManual){ hasil.manual++; continue; }
       if(state.modal && state.modal.pegawaiId===p.id){ continue; } // sedang dibuka di layar edit — jangan diubah diam-diam
       const sum = await computeAttendanceSummary(p.id, r.start, r.end, logsMap);
-      if(sum.hadirHari===0){ hasil.tanpaData++; continue; }
+      if(sum.hadirHari+sum.tanpaPulang===0){ hasil.tanpaData++; continue; }
       const lama = pn.absensi || {};
       const sama = lama.hadir_persen===sum.hadir_persen && lama.terlambat===sum.terlambat && lama.alpha===sum.alpha;
       const infoLama = pn.absensi_auto;
       pn.absensi = { hadir_persen:sum.hadir_persen, terlambat:sum.terlambat, alpha:sum.alpha, sp_aktif: lama.sp_aktif||0 };
       pn.absensi_manual = false;
-      pn.absensi_auto = { dari:r.start, sampai:r.end, hariKerja:sum.totalHari, hadir:sum.hadirHari, cuti:sum.cutiHari, libur:sum.liburHari, penuh:r.penuh };
+      pn.absensi_auto = { dari:r.start, sampai:r.end, hariKerja:sum.totalHari, hadir:sum.hadirHari, cuti:sum.cutiHari, libur:sum.liburHari, tanpaPulang:sum.tanpaPulang, janggal:sum.janggal, penuh:r.penuh };
+      hasil.tanpaPulang = (hasil.tanpaPulang||0) + sum.tanpaPulang; hasil.janggal = (hasil.janggal||0) + sum.janggal;
       if(sama) hasil.sama++; else hasil.diperbarui++;
       if(!sama || !infoLama || infoLama.sampai!==r.end) toSave.push(p.id);
     }
@@ -1790,6 +1834,8 @@ function paintAbsenSyncBanner(){
     parts.push(h.diperbarui+' diperbarui, '+h.sama+' sudah sesuai');
     if(h.tanpaData) parts.push(h.tanpaData+' pegawai belum punya data Absen Mandiri (tidak diisi otomatis)');
     if(h.manual) parts.push(h.manual+' diisi manual (tidak ditimpa)');
+    if(h.tanpaPulang) parts.push(h.tanpaPulang+' hari absen masuk tanpa absen pulang ('+(state.aturanAbsen.tanpaPulang==='alpha'?'dihitung alpha':'ditandai, tetap dihitung hadir')+')');
+    if(h.janggal) parts.push(h.janggal+' hari jam masuk/pulang janggal');
     if(h.beku) parts.push(h.beku+' sudah divalidasi (terkunci)');
     msg = parts.join(' · ');
   } else return;
@@ -4296,14 +4342,14 @@ function exportJamKedatanganExcel(rows, tanggalLabel, unitLabel){
     ['Tanggal: '+tanggalLabel],
     ['Diunduh: '+new Date().toLocaleString('id-ID')],
     [],
-    ['Tanggal','Nama','Unit','Shift','Jam Masuk','Jam Pulang','Status','Catatan Waktu/Lokasi'],
+    ['Tanggal','Nama','Unit','Shift','Jam Masuk','Jam Pulang','Status','Kelengkapan Absen','Catatan Waktu/Lokasi'],
   ];
   rows.forEach(r=>{
     const statusLabel = {cuti:'Cuti', libur:'Libur', ontime:'Tepat Waktu', telat:'Terlambat', alpha:'Belum Absen', '-':'-'}[r.statusMasuk] || r.statusMasuk;
-    data.push([r.tanggal||tanggalLabel, r.nama, r.unit, r.shiftNama, r.jamMasuk||'-', r.jamPulang||'-', statusLabel, r.catatanWaktu||'']);
+    data.push([r.tanggal||tanggalLabel, r.nama, r.unit, r.shiftNama, r.jamMasuk||'-', r.jamPulang||'-', statusLabel, [r.tanpaPulang?'Tidak absen pulang':'', r.janggal||''].filter(Boolean).join('; '), r.catatanWaktu||'']);
   });
   const ws = XLSX.utils.aoa_to_sheet(data);
-  ws['!cols'] = [{wch:13},{wch:26},{wch:16},{wch:14},{wch:12},{wch:12},{wch:14},{wch:50}];
+  ws['!cols'] = [{wch:13},{wch:26},{wch:16},{wch:14},{wch:12},{wch:12},{wch:14},{wch:34},{wch:50}];
   ws['!merges'] = [{s:{r:0,c:0},e:{r:0,c:6}},{s:{r:1,c:0},e:{r:1,c:6}},{s:{r:2,c:0},e:{r:2,c:6}},{s:{r:3,c:0},e:{r:3,c:6}}];
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Jam Kedatangan');
@@ -4360,14 +4406,14 @@ function exportRekapAbsensiExcel(rows, periode, unitLabel){
     ['Rentang: '+periode],
     ['Diunduh: '+new Date().toLocaleString('id-ID')],
     [],
-    ['Nama','Unit','Shift','% Hadir','Terlambat (kali)','Alpha (hari)','Hari Libur','Hari Cuti','Total Hari Kerja'],
+    ['Nama','Unit','Shift','% Hadir','Terlambat (kali)','Alpha (hari)','Tanpa Absen Pulang (hari)','Jam Janggal (hari)','Hari Libur','Hari Cuti','Total Hari Kerja'],
   ];
   rows.forEach(r=>{
-    data.push([r.nama, r.unit, r.shiftNama, r.hadir_persen, r.terlambat, r.alpha, r.liburHari, r.cutiHari||0, r.totalHari]);
+    data.push([r.nama, r.unit, r.shiftNama, r.hadir_persen, r.terlambat, r.alpha, r.tanpaPulang||0, r.janggal||0, r.liburHari, r.cutiHari||0, r.totalHari]);
   });
   const ws = XLSX.utils.aoa_to_sheet(data);
-  ws['!cols'] = [{wch:26},{wch:16},{wch:16},{wch:10},{wch:14},{wch:12},{wch:11},{wch:11},{wch:16}];
-  ws['!merges'] = [{s:{r:0,c:0},e:{r:0,c:8}},{s:{r:1,c:0},e:{r:1,c:8}},{s:{r:2,c:0},e:{r:2,c:8}},{s:{r:3,c:0},e:{r:3,c:8}}];
+  ws['!cols'] = [{wch:26},{wch:16},{wch:16},{wch:10},{wch:14},{wch:12},{wch:16},{wch:14},{wch:11},{wch:11},{wch:16}];
+  ws['!merges'] = [{s:{r:0,c:0},e:{r:0,c:10}},{s:{r:1,c:0},e:{r:1,c:10}},{s:{r:2,c:0},e:{r:2,c:10}},{s:{r:3,c:0},e:{r:3,c:10}}];
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Rekap Absensi');
   XLSX.writeFile(wb, 'Rekap-Absensi-'+periode.replace(/\s+/g,'')+'.xlsx');
@@ -4431,7 +4477,9 @@ async function renderRekapAbsensi(body){
       if(r.fotoMasuk){
         jamMasukCell.appendChild(el('button',{class:'btn btn-outline btn-sm', style:'margin-left:6px;padding:2px 7px;', title:'Lihat foto selfie absen masuk', onclick:()=>showPhotoLightbox(r.fotoMasuk, r.nama+' — Absen Masuk '+r.jamMasuk+' ('+r.tanggal+')')},['📷']));
       }
-      const jamPulangCell = el('td',{style:'font-weight:700;'},[r.jamPulang||'—']);
+      const jamPulangCell = el('td',{style:'font-weight:700;'},[r.jamPulang||(r.tanpaPulang?'':'—')]);
+      if(r.tanpaPulang && !r.jamPulang) jamPulangCell.appendChild(el('span',{style:'color:var(--red);font-weight:700;font-size:11.5px;', title:'Ada Absen Masuk tetapi tidak ada Absen Pulang'},['⚠️ tidak absen pulang']));
+      if(r.janggal) jamPulangCell.appendChild(el('span',{title:r.janggal, style:'margin-left:5px;cursor:help;', onclick:()=>alert('⚠️ Jam janggal — '+r.nama+' ('+r.tanggal+')\n\n'+r.janggal+'\n\nPeriksa foto selfie masuk/pulang dan tanyakan ke pegawai bila perlu.')},['⚠️']));
       if(r.fotoPulang){
         jamPulangCell.appendChild(el('button',{class:'btn btn-outline btn-sm', style:'margin-left:6px;padding:2px 7px;', title:'Lihat foto selfie absen pulang', onclick:()=>showPhotoLightbox(r.fotoPulang, r.nama+' — Absen Pulang '+r.jamPulang+' ('+r.tanggal+')')},['📷']));
       }
@@ -4470,7 +4518,7 @@ async function renderRekapAbsensi(body){
       } else if(new Date(dateVal) <= new Date(todayISO())) {
         statusMasuk = 'alpha';
       }
-      return { tanggal:dateVal, nama:p.nama, unit:unitName(p.unitId), jamMasuk: log.masuk?log.masuk.jam:null, jamPulang: log.pulang?log.pulang.jam:null, catatanWaktu: waktuCatatan(log), statusMasuk, shiftNama: shift.cuti?shift.nama:(shift.libur?'Libur':shift.nama), fotoMasuk: log.masuk?log.masuk.foto:null, fotoPulang: log.pulang?log.pulang.foto:null };
+      return { tanggal:dateVal, nama:p.nama, unit:unitName(p.unitId), jamMasuk: log.masuk?log.masuk.jam:null, jamPulang: log.pulang?log.pulang.jam:null, catatanWaktu: waktuCatatan(log), ...cekFieldsRow(log, shift, dateVal), statusMasuk, shiftNama: shift.cuti?shift.nama:(shift.libur?'Libur':shift.nama), fotoMasuk: log.masuk?log.masuk.foto:null, fotoPulang: log.pulang?log.pulang.foto:null };
     });
     lastJamRows = rows;
     jamDlBtn.style.display = '';
@@ -4590,12 +4638,13 @@ async function renderRekapAbsensi(body){
     const table = el('table');
     table.appendChild(el('tr',null,[
       el('th',null,['Nama']),el('th',null,['Unit']),el('th',null,['Shift']),el('th',null,['% Hadir']),
-      el('th',null,['Terlambat']),el('th',null,['Alpha']),el('th',null,['Libur']),el('th',null,['Cuti']),el('th',null,['Total Hari'])
+      el('th',null,['Terlambat']),el('th',null,['Alpha']),el('th',null,['Tanpa Pulang']),el('th',null,['Jam Janggal']),el('th',null,['Libur']),el('th',null,['Cuti']),el('th',null,['Total Hari'])
     ]));
     rows.forEach(r=>{
       table.appendChild(el('tr',null,[
         el('td',null,[r.nama]), el('td',null,[r.unit]), el('td',null,[r.shiftNama]),
         el('td',null,[r.hadir_persen+'%']), el('td',null,[String(r.terlambat)]), el('td',null,[String(r.alpha)]),
+        el('td',{style:r.tanpaPulang?'color:var(--red);font-weight:700;':''},[String(r.tanpaPulang||0)]), el('td',{style:r.janggal?'color:var(--red);font-weight:700;':''},[String(r.janggal||0)]),
         el('td',null,[String(r.liburHari)]), el('td',null,[String(r.cutiHari||0)]), el('td',null,[String(r.totalHari)]),
       ]));
     });
@@ -4636,7 +4685,7 @@ async function renderRekapAbsensi(body){
       if(doneCount % 5 === 0 || doneCount===staffPool.length){
         progressEl.firstChild.textContent = 'Menghitung rekap untuk '+staffPool.length+' pegawai… ('+doneCount+'/'+staffPool.length+')';
       }
-      return { nama:p.nama, unit:unitName(p.unitId), shiftNama:sum.shiftNama, hadir_persen:sum.hadir_persen, terlambat:sum.terlambat, alpha:sum.alpha, liburHari:sum.liburHari, cutiHari:sum.cutiHari, totalHari:sum.totalHari };
+      return { nama:p.nama, unit:unitName(p.unitId), shiftNama:sum.shiftNama, hadir_persen:sum.hadir_persen, terlambat:sum.terlambat, alpha:sum.alpha, liburHari:sum.liburHari, cutiHari:sum.cutiHari, totalHari:sum.totalHari, tanpaPulang:sum.tanpaPulang, janggal:sum.janggal };
     });
     lastRows = rows;
     rekapSearchInp.value = '';
@@ -4681,7 +4730,7 @@ async function renderRekapAbsensi(body){
         }
         done++;
         if(done % 20===0 || done===tasks.length) detailDlBtn.textContent = 'Menyiapkan… ('+done+'/'+tasks.length+')';
-        return { tanggal:dateVal, nama:p.nama, unit:unitName(p.unitId), shiftNama: shift.cuti?shift.nama:(shift.libur?'Libur':shift.nama), jamMasuk: log.masuk?log.masuk.jam:null, jamPulang: log.pulang?log.pulang.jam:null, statusMasuk };
+        return { ...cekFieldsRow(log, shift, dateVal), tanggal:dateVal, nama:p.nama, unit:unitName(p.unitId), shiftNama: shift.cuti?shift.nama:(shift.libur?'Libur':shift.nama), jamMasuk: log.masuk?log.masuk.jam:null, jamPulang: log.pulang?log.pulang.jam:null, statusMasuk };
       });
       // urutkan rapi: per tanggal, lalu per nama — supaya enak dibaca sebagai buku absen harian
       allRows.sort((a,b)=> a.tanggal===b.tanggal ? a.nama.localeCompare(b.nama) : a.tanggal.localeCompare(b.tanggal));
@@ -5738,6 +5787,24 @@ function renderPengaturan(body){
   panelShift.appendChild(defRow);
   body.appendChild(panelShift);
 
+  /* Aturan Absen — perlakuan absen masuk tanpa absen pulang & batas minimal selisih masuk–pulang */
+  const panelAturan = el('div',{class:'panel'});
+  panelAturan.appendChild(el('h3',null,['📏 Aturan Kelengkapan Absen']));
+  panelAturan.appendChild(el('div',{class:'small-note',style:'margin-bottom:12px;'},['Menentukan bagaimana hari dengan Absen Masuk tetapi tanpa Absen Pulang diperlakukan dalam rekap & penilaian. Berlaku untuk hari yang sudah lewat (hari ini dan sesi shift malam yang masih berjalan tidak dihitung).']));
+  const selTp = el('select',{style:'padding:8px 10px;border:1px solid var(--line);border-radius:7px;'});
+  [['tandai','Tetap dihitung hadir, tetapi ditandai ⚠️ di rekap (disarankan untuk awal)'],['alpha','Dihitung TIDAK hadir (alpha) — tegas, berdampak pada nilai & tukin']].forEach(([v,l])=>{
+    const o = el('option',{value:v},[l]); if(state.aturanAbsen.tanpaPulang===v) o.selected=true; selTp.appendChild(o);
+  });
+  selTp.addEventListener('change', e=>{ state.aturanAbsen.tanpaPulang = e.target.value; state.absenSync = null; bgSave(saveAbsensiConfig()); });
+  const inpDur = el('input',{type:'number',min:'0',max:'240',value:state.aturanAbsen.minDurasiMenit,style:'width:90px;padding:8px 10px;border:1px solid var(--line);border-radius:7px;'});
+  inpDur.addEventListener('change', e=>{ state.aturanAbsen.minDurasiMenit = Math.max(0, Number(e.target.value)||0); state.absenSync = null; bgSave(saveAbsensiConfig()); });
+  panelAturan.appendChild(el('div',{style:'display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end;'},[
+    el('div',{class:'field',style:'flex:1;min-width:260px;'},[el('label',null,['Absen Masuk tanpa Absen Pulang']), selTp]),
+    el('div',{class:'field'},[el('label',null,['Selisih minimal masuk–pulang (menit)']), inpDur]),
+  ]));
+  panelAturan.appendChild(el('div',{class:'small-note',style:'margin-top:8px;'},['Selisih di bawah batas ini (mis. salah tekan dua kali) ditandai janggal, dan Absen Pulang ditolak bila ditekan terlalu cepat setelah Absen Masuk. Setelah mengubah aturan, hitung ulang absensi di menu Input Penilaian / Rekap.']));
+  body.appendChild(panelAturan);
+
   /* Keamanan Admin — PIN */
   const panelPin = el('div',{class:'panel'});
   panelPin.appendChild(el('h3',null,['🔐 Keamanan Admin']));
@@ -6115,7 +6182,7 @@ function buildInputPenilaianModal(modal){
   let manualTouched = !!pn.absensi_manual;
   { const ai = pn.absensi_auto;
     if(pn.absensi_manual) modal.appendChild(el('div',{class:'small-note',style:'margin-bottom:8px;color:var(--gold);'},['✏️ Angka absensi diisi manual — tidak ditimpa hitungan otomatis.']));
-    else if(ai) modal.appendChild(el('div',{class:'small-note',style:'margin-bottom:8px;color:var(--teal);'},['✓ Terisi otomatis dari Absen Mandiri ('+ai.dari+' s/d '+ai.sampai+'): '+ai.hadir+' hadir dari '+ai.hariKerja+' hari kerja'+(ai.cuti?', '+ai.cuti+' hari cuti tidak dihitung':'')+'.']));
+    else if(ai) modal.appendChild(el('div',{class:'small-note',style:'margin-bottom:8px;color:var(--teal);'},['✓ Terisi otomatis dari Absen Mandiri ('+ai.dari+' s/d '+ai.sampai+'): '+ai.hadir+' hadir dari '+ai.hariKerja+' hari kerja'+(ai.cuti?', '+ai.cuti+' hari cuti tidak dihitung':'')+(ai.tanpaPulang?' · ⚠️ '+ai.tanpaPulang+' hari tanpa absen pulang':'')+(ai.janggal?' · ⚠️ '+ai.janggal+' hari jam janggal':'')+'.']));
     else modal.appendChild(el('div',{class:'small-note',style:'margin-bottom:8px;'},['Belum ada data Absen Mandiri untuk periode ini — isi manual, atau tekan tombol di bawah bila datanya sudah ada.'])); }
 
   if(editable){
