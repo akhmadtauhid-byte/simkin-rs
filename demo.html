@@ -5882,20 +5882,49 @@ function bangunFilterWaktuRekap(){
   mode.addEventListener('change', e=>{ rr.aktif = e.target.value==='1'; rerender(); });
   row.appendChild(mode);
   if(rr.aktif){
-    const mk = (val,fn)=>{ const sel=el('select'); L.forEach(pr=>{ const o=el('option',{value:pr},[pr]); if(pr===val) o.selected=true; sel.appendChild(o); }); sel.addEventListener('change',e=>{ fn(e.target.value); rerender(); }); return sel; };
+    const mk = (val,fn)=>{ const sel=el('select'); L.forEach(pr=>{ const o=el('option',{value:pr},[pr]); if(pr===val) o.selected=true; sel.appendChild(o); }); sel.addEventListener('change',e=>{ rr.tglDari=null; rr.tglSampai=null; fn(e.target.value); rerender(); }); return sel; };
     row.appendChild(el('span',{style:'font-size:12px;color:var(--ink-soft);'},['Dari:']));
     row.appendChild(mk(rr.dari, v=>{ rr.dari=v; if(L.indexOf(rr.sampai)<L.indexOf(v)) rr.sampai=v; }));
     row.appendChild(el('span',{style:'font-size:12px;color:var(--ink-soft);'},['s/d']));
     row.appendChild(mk(rr.sampai, v=>{ rr.sampai=v; if(L.indexOf(rr.dari)>L.indexOf(v)) rr.dari=v; }));
+    const tglRow = el('div',{style:'display:flex;gap:8px;align-items:center;flex-wrap:wrap;width:100%;margin-top:6px;'});
+    tglRow.appendChild(el('span',{style:'font-size:12px;color:var(--ink-soft);'},['atau pilih tanggal:']));
+    const tD = el('input',{type:'date', value:rr.tglDari||''}), tS = el('input',{type:'date', value:rr.tglSampai||''});
+    const terapkan = ()=>{
+      if(!tD.value || !tS.value) return;
+      let a=tD.value, b=tS.value; if(b<a){ const t=a; a=b; b=t; }
+      const o = periodeOverlapTanggal(a,b);
+      if(!o.length){ alert('Tidak ada periode penilaian yang tumpang-tindih dengan rentang tanggal itu.'); return; }
+      rr.tglDari=a; rr.tglSampai=b; rr.dari=o[0]; rr.sampai=o[o.length-1]; rerender();
+    };
+    tD.addEventListener('change', terapkan); tS.addEventListener('change', terapkan);
+    tglRow.appendChild(tD); tglRow.appendChild(el('span',{style:'font-size:12px;color:var(--ink-soft);'},['s/d'])); tglRow.appendChild(tS);
+    if(rr.tglDari && rr.tglSampai){
+      tglRow.appendChild(el('button',{class:'btn btn-outline btn-sm',type:'button',onclick:()=>{ rr.tglDari=null; rr.tglSampai=null; rerender(); }},['✕ Hapus tanggal']));
+      tglRow.appendChild(el('div',{class:'small-note',style:'width:100%;'},['Periode yang tercakup: '+periodeDalamRentang().join(', ')+'. Tukin dihitung per periode penuh (tidak dipecah per hari), jadi periode yang hanya sebagian tercakup tetap dihitung utuh.']));
+    }
+    row.appendChild(tglRow);
     [['Semua periode',()=>{rr.dari=L[0]; rr.sampai=L[L.length-1];}],['3 periode terakhir',()=>{rr.dari=L[Math.max(0,L.length-3)]; rr.sampai=L[L.length-1];}],['Tahun ini',()=>{ const th=String(new Date().getFullYear()); const ada=L.filter(x=>x.includes(th)); if(ada.length){rr.dari=ada[0]; rr.sampai=ada[ada.length-1];} }]].forEach(([l,fn])=>{
-      row.appendChild(el('button',{class:'btn btn-outline btn-sm',type:'button',onclick:()=>{ fn(); rerender(); }},[l]));
+      row.appendChild(el('button',{class:'btn btn-outline btn-sm',type:'button',onclick:()=>{ rr.tglDari=null; rr.tglSampai=null; fn(); rerender(); }},[l]));
     });
   }
   bar.appendChild(row);
   return bar;
 }
+function rentangBulanPenuh(periode){
+  const t = String(periode||'').toLowerCase(); let bln=null, thn=null, m;
+  if((m = t.match(/(\d{4})[-\/](\d{1,2})/))){ thn=+m[1]; bln=+m[2]; }
+  else if((m = t.match(/([a-z]+)\D+(\d{4})/))){ bln = BULAN_ID[m[1]]||null; thn=+m[2]; }
+  if(!bln || bln<1 || bln>12 || !thn) return null;
+  const pad = n=>String(n).padStart(2,'0');
+  return { start: thn+'-'+pad(bln)+'-01', end: thn+'-'+pad(bln)+'-'+pad(new Date(Date.UTC(thn,bln,0)).getUTCDate()) };
+}
+function periodeOverlapTanggal(dari, sampai){
+  return state.periodeList.filter(pr=>{ const r=rentangBulanPenuh(pr); return r && r.start<=sampai && r.end>=dari; });
+}
 function periodeDalamRentang(){
   const rr = state.rekapRange, L = state.periodeList;
+  if(rr.tglDari && rr.tglSampai){ const o = periodeOverlapTanggal(rr.tglDari, rr.tglSampai); if(o.length) return o; }
   const a = L.indexOf(rr.dari), b = L.indexOf(rr.sampai);
   return L.slice(Math.min(a,b), Math.max(a,b)+1);
 }
@@ -5924,7 +5953,8 @@ function exportRekapRentangExcel(hasil, label){
 }
 function renderRekapRentang(body){
   const hasil = hitungRekapRentang(), {daftar, rows} = hasil;
-  const label = daftar.length>1 ? daftar[0]+' s.d. '+daftar[daftar.length-1] : daftar[0];
+  let label = daftar.length>1 ? daftar[0]+' s.d. '+daftar[daftar.length-1] : daftar[0];
+  if(state.rekapRange.tglDari && state.rekapRange.tglSampai) label += ' (tgl '+state.rekapRange.tglDari+' s.d. '+state.rekapRange.tglSampai+')';
   const ada = rows.filter(r=>r.nFinal>0);
   const totalRp = rows.reduce((a,r)=>a+r.total,0);
   const cards = el('div',{class:'cards-row'});
