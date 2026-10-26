@@ -2123,6 +2123,70 @@ async function bukaJamKerjaPegawai(p, startISO, endISO){
   }},['💾 Unduh Excel pegawai ini'])]));
 }
 
+/* ============ KOREKSI NILAI KINERJA & MUTU OLEH ADMIN ============
+ * Admin boleh mengubah skor Kinerja Pelayanan dan Mutu Pelayanan pegawai pada status APA PUN (termasuk Final), dengan
+ * pratinjau dampak (skor akhir, grade, tukin lama → baru), alasan wajib, dan riwayat yang tercatat permanen di penilaian. */
+function bukaKoreksiNilaiAdmin(p){
+  if(state.role!=='admin'){ alert('Hanya Admin yang dapat mengoreksi nilai.'); return; }
+  const periode = state.periode;
+  const pn = getPenilaian(periode, p.id);
+  const lamaK = {...(pn.kinerja_score||{})}, lamaM = {...(pn.mutu_score||{})};
+  const baruK = {...lamaK}, baruM = {...lamaM};
+  const overlay = el('div',{style:'position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:9998;display:flex;align-items:center;justify-content:center;padding:16px;'});
+  const card = el('div',{style:'background:#fff;border-radius:14px;padding:20px;max-width:760px;width:100%;max-height:92vh;overflow:auto;'});
+  overlay.appendChild(card); document.body.appendChild(overlay);
+  const tutup = ()=>{ if(overlay.parentNode) overlay.parentNode.removeChild(overlay); };
+  card.appendChild(el('div',{style:'display:flex;justify-content:space-between;gap:10px;align-items:flex-start;'},[
+    el('div',null,[el('h3',{style:'margin:0;'},['✏️ Koreksi Nilai oleh Admin — '+p.nama]), el('div',{class:'small-note'},[unitName(p.unitId)+' · '+p.jabatan+' · Periode '+periode+' · Status: '+(STATUS_LABEL_SAFE(pn.status))])]),
+    el('button',{class:'btn btn-outline btn-sm',onclick:tutup},['Tutup'])]));
+  if(pn.status==='FINAL') card.appendChild(el('div',{class:'warn-note',style:'margin:10px 0;'},['Penilaian ini sudah FINAL. Mengubah nilai akan mengubah tukin yang sudah disahkan; status tetap Final. Pastikan tukin periode ini belum dicairkan atau memang perlu dikoreksi.']));
+  const prev = el('div',{style:'background:var(--bg-soft,#f4f7f6);border-radius:10px;padding:10px 14px;margin:10px 0;font-size:13px;line-height:1.6;'});
+  function hitung(skK, skM){
+    const tmp = {...pn, kinerja_score:skK, mutu_score:skM};
+    const f = computeFinal(tmp, p.unitId);
+    const nom = Math.round(Number(p.tukin_maks||0)*f.tier.persen/100);
+    return {f, nom};
+  }
+  const awal = hitung(lamaK, lamaM);
+  function segarkan(){
+    const b = hitung(baruK, baruM);
+    prev.innerHTML = '';
+    const fmt = v=> v==null ? '—' : v.toFixed(2);
+    prev.appendChild(el('div',null,['Rata-rata Kinerja: ',el('b',null,[fmt(awal.f.kinerjaAvg)+' → '+fmt(b.f.kinerjaAvg)]),'  ·  Rata-rata Mutu: ',el('b',null,[fmt(awal.f.mutuAvg)+' → '+fmt(b.f.mutuAvg)])]));
+    prev.appendChild(el('div',null,['Skor akhir: ',el('b',null,[awal.f.percent.toFixed(1)+'% → '+b.f.percent.toFixed(1)+'%']),'  ·  Grade ',el('b',null,[awal.f.tier.grade+' → '+b.f.tier.grade]),'  ·  % Tukin ',el('b',null,[awal.f.tier.persen+'% → '+b.f.tier.persen+'%'])]));
+    if(pn.status==='FINAL') prev.appendChild(el('div',null,['Nominal tukin: ',el('b',{style:'color:'+(b.nom<awal.nom?'var(--red)':'var(--green)')+';'},[fmtRp(awal.nom)+' → '+fmtRp(b.nom)])]));
+  }
+  card.appendChild(el('h4',{style:'font-size:13px;margin:12px 0 4px;'},['Kinerja Pelayanan']));
+  state.aspekConfig.kinerja.forEach(a=>card.appendChild(buildScoreRow(a, baruK[a.key], true, v=>{ baruK[a.key]=v; segarkan(); })));
+  card.appendChild(el('h4',{style:'font-size:13px;margin:14px 0 4px;'},['Mutu Pelayanan']));
+  state.aspekConfig.mutu.forEach(a=>card.appendChild(buildScoreRow(a, baruM[a.key], true, v=>{ baruM[a.key]=v; segarkan(); })));
+  card.appendChild(prev); segarkan();
+  const alasan = el('textarea',{rows:'2',placeholder:'Alasan koreksi wajib diisi (mis. "Nilai kinerja disesuaikan hasil rapat komite tanggal …")',style:'width:100%;'});
+  card.appendChild(el('div',{class:'field'},[el('label',null,['Alasan koreksi']), alasan]));
+  const rk = pn.riwayat_koreksi || [];
+  if(rk.length){
+    card.appendChild(el('div',{class:'small-note',style:'margin-top:6px;'},['Riwayat koreksi sebelumnya:']));
+    rk.slice(-3).reverse().forEach(r=>card.appendChild(el('div',{class:'small-note',style:'color:var(--gold);'},['• '+new Date(r.pada).toLocaleDateString('id-ID')+' oleh '+r.oleh+' — '+r.alasan+' (skor '+r.persenLama+'% → '+r.persenBaru+'%)'])));
+  }
+  const aksi = el('div',{style:'display:flex;gap:8px;justify-content:flex-end;margin-top:14px;'});
+  aksi.appendChild(el('button',{class:'btn btn-outline',onclick:tutup},['Batal']));
+  const btn = el('button',{class:'btn btn-gold',onclick: async ()=>{
+    const berubah = JSON.stringify(lamaK)!==JSON.stringify(baruK) || JSON.stringify(lamaM)!==JSON.stringify(baruM);
+    if(!berubah){ alert('Belum ada nilai yang diubah.'); return; }
+    if(alasan.value.trim().length<10){ alert('Isi alasan koreksi (minimal 10 karakter).'); return; }
+    if(pn.status==='FINAL' && !confirm('Penilaian ini sudah FINAL. Terapkan koreksi dan ubah tukinnya?')) return;
+    btn.disabled = true; btn.textContent='Menyimpan…';
+    const b = hitung(baruK, baruM);
+    pn.kinerja_score = {...baruK}; pn.mutu_score = {...baruM};
+    pn.riwayat_koreksi = (pn.riwayat_koreksi||[]).concat([{ pada:new Date(trustedNowMs()).toISOString(), oleh:'Admin', alasan:alasan.value.trim(), status:pn.status,
+      kinerjaLama:lamaK, kinerjaBaru:{...baruK}, mutuLama:lamaM, mutuBaru:{...baruM}, persenLama:+awal.f.percent.toFixed(1), persenBaru:+b.f.percent.toFixed(1), nomLama:awal.nom, nomBaru:b.nom }]);
+    try{ await savePenilaian(periode, p.id); tutup(); state.modal=null; rerender(); alert('✓ Koreksi nilai tersimpan dan tercatat di riwayat.'); }
+    catch(e){ alert('❌ Gagal menyimpan ke server: '+(e.message||e)+'\n\nPerubahan belum tersimpan permanen — coba lagi.'); btn.disabled=false; btn.textContent='Simpan Koreksi'; }
+  }},['Simpan Koreksi']);
+  aksi.appendChild(btn); card.appendChild(aksi);
+}
+function STATUS_LABEL_SAFE(st){ try{ return (typeof STATUS_LABEL!=='undefined' && STATUS_LABEL[st]) || st; }catch(e){ return st; } }
+
 function slugify(nama){
   return 'asp_'+nama.toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'').slice(0,30)+'_'+Math.floor(Math.random()*10000);
 }
@@ -4586,6 +4650,34 @@ async function runAIPenilaianBatch(staffList, narrative, pdfAttachment){
 
 /* ============ INPUT PENILAIAN (Kepala Unit) ============ */
 /* ============ JADWAL JAGA (kalender shift per hari, per pegawai — untuk shift bergilir/rolling) ============ */
+function isoLokal(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
+function rentangPreset(kode){
+  const [y,m,d] = todayISO().split('-').map(Number);
+  const h = new Date(y,m-1,d);
+  if(kode==='hari') return [isoLokal(h), isoLokal(h)];
+  if(kode==='kemarin'){ const k=new Date(y,m-1,d-1); return [isoLokal(k), isoLokal(k)]; }
+  if(kode==='7hari') return [isoLokal(new Date(y,m-1,d-6)), isoLokal(h)];
+  if(kode==='bulan') return [isoLokal(new Date(y,m-1,1)), isoLokal(h)];
+  if(kode==='bulanlalu') return [isoLokal(new Date(y,m-2,1)), isoLokal(new Date(y,m-1,0))];
+  return [isoLokal(h), isoLokal(h)];
+}
+function buatPresetRentang(inpDari, inpSampai, onPilih){
+  const wrap = el('div',{style:'display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px;'});
+  wrap.appendChild(el('span',{style:'font-size:12px;color:var(--ink-soft);'},['Pilih cepat:']));
+  [['hari','Hari ini'],['kemarin','Kemarin'],['7hari','7 hari terakhir'],['bulan','Bulan ini'],['bulanlalu','Bulan lalu']].forEach(([k,l])=>{
+    wrap.appendChild(el('button',{class:'btn btn-outline btn-sm',type:'button',onclick:()=>{ const [a,b]=rentangPreset(k); inpDari.value=a; inpSampai.value=b; if(onPilih) onPilih(); }},[l]));
+  });
+  return wrap;
+}
+function daftarTanggalRentang(dari, sampai, maxHari){
+  const out=[]; if(!dari||!sampai) return out;
+  const [y1,m1,d1]=dari.split('-').map(Number), [y2,m2,d2]=sampai.split('-').map(Number);
+  const akhir = new Date(y2,m2-1,d2), batasHariIni = todayISO();
+  for(let d=new Date(y1,m1-1,d1); d<=akhir && out.length<(maxHari||400); d.setDate(d.getDate()+1)){
+    const iso=isoLokal(d); if(iso>batasHariIni) break; out.push(iso);
+  }
+  return out;
+}
 function exportJamKedatanganExcel(rows, tanggalLabel, unitLabel){
   const data = [
     ['REKAP JAM KEDATANGAN & PULANG — RSU ALLAM MEDICA'],
@@ -4692,13 +4784,21 @@ async function renderRekapAbsensi(body){
   panelJam.appendChild(el('div',{class:'small-note',style:'margin-bottom:10px;'},['Lihat jam absen masuk & pulang tiap pegawai untuk tanggal tertentu (langsung dari data Absen Mandiri).']));
   const jamDateRow = el('div',{style:'display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px;'});
   const jamDate = el('input',{type:'date', value:todayISO()});
+  const jamDateEnd = el('input',{type:'date', value:todayISO()});
+  const jamFilter = el('select');
+  [['','Semua status'],['telat','Terlambat'],['alpha','Belum absen / alpha'],['tanpapulang','Tanpa absen pulang'],['janggal','Jam janggal']].forEach(([v,l])=>jamFilter.appendChild(el('option',{value:v},[l])));
   const jamBtn = el('button',{class:'btn btn-primary btn-sm'},['🔄 Tampilkan']);
   const jamDlBtn = el('button',{class:'btn btn-outline btn-sm', style:'display:none;'},['💾 Unduh Excel']);
-  jamDateRow.appendChild(el('span',{style:'font-size:12px;color:var(--ink-soft);'},['Tanggal:']));
+  jamDateRow.appendChild(el('span',{style:'font-size:12px;color:var(--ink-soft);'},['Dari:']));
   jamDateRow.appendChild(jamDate);
+  jamDateRow.appendChild(el('span',{style:'font-size:12px;color:var(--ink-soft);'},['s/d']));
+  jamDateRow.appendChild(jamDateEnd);
   jamDateRow.appendChild(jamBtn);
   jamDateRow.appendChild(jamDlBtn);
+  panelJam.appendChild(buatPresetRentang(jamDate, jamDateEnd, ()=>loadJamKedatangan()));
   panelJam.appendChild(jamDateRow);
+  panelJam.appendChild(el('div',{class:'small-note',style:'margin:-6px 0 10px;'},['Isi tanggal yang sama untuk satu hari, atau pilih rentang untuk melihat jam masuk/pulang setiap pegawai di setiap hari dalam rentang (maksimal 62 hari). Gunakan filter status untuk menyaring yang bermasalah.']));
+  { const fr = el('div',{style:'display:flex;gap:8px;align-items:center;margin-bottom:8px;'}); fr.appendChild(el('span',{style:'font-size:12px;color:var(--ink-soft);'},['Filter:'])); fr.appendChild(jamFilter); panelJam.appendChild(fr); }
   // Pencarian nama LOKAL (tidak memicu ambil ulang data dari server tiap huruf diketik — cukup menyaring hasil yang sudah dimuat)
   const jamSearchInp = el('input',{type:'text', placeholder:'🔍 Cari nama pegawai (dari hasil yang sudah dimuat)…', style:'width:100%;margin-bottom:10px;'});
   panelJam.appendChild(jamSearchInp);
@@ -4707,14 +4807,30 @@ async function renderRekapAbsensi(body){
   body.appendChild(panelJam);
 
   let lastJamRows = null;
+  function saringJam(){
+    if(!lastJamRows) return [];
+    const q = jamSearchInp.value.trim().toLowerCase(), f = jamFilter.value;
+    return lastJamRows.filter(r=>{
+      if(q && !r.nama.toLowerCase().includes(q)) return false;
+      if(f==='telat') return r.statusMasuk==='telat';
+      if(f==='alpha') return r.statusMasuk==='alpha';
+      if(f==='tanpapulang') return !!r.tanpaPulang;
+      if(f==='janggal') return !!r.janggal;
+      return true;
+    });
+  }
   function renderJamTable(rows){
     jamResult.innerHTML = '';
     if(rows.length===0){
-      jamResult.appendChild(el('div',{class:'empty'},['Tidak ada yang cocok dengan pencarian.']));
+      jamResult.appendChild(el('div',{class:'empty'},['Tidak ada data yang cocok dengan pencarian/filter.']));
       return;
     }
+    const multi = new Set((lastJamRows||[]).map(r=>r.tanggal)).size>1;
+    const BATAS = 600;
+    jamResult.appendChild(el('div',{class:'small-note',style:'margin-bottom:6px;'},[rows.length+' baris'+(rows.length>BATAS?' — ditampilkan '+BATAS+' pertama; persempit dengan pencarian/filter atau unduh Excel untuk semuanya.':'')]));
+    if(rows.length>BATAS) rows = rows.slice(0,BATAS);
     const table = el('table');
-    table.appendChild(el('tr',null,[el('th',null,['Nama']), el('th',null,['Unit']), el('th',null,['Shift']), el('th',null,['Jam Masuk']), el('th',null,['Jam Pulang']), el('th',null,['Durasi']), el('th',null,['Status'])]));
+    table.appendChild(el('tr',null,(multi?[el('th',null,['Tanggal'])]:[]).concat([el('th',null,['Nama']), el('th',null,['Unit']), el('th',null,['Shift']), el('th',null,['Jam Masuk']), el('th',null,['Jam Pulang']), el('th',null,['Durasi']), el('th',null,['Status'])])));
     rows.forEach(r=>{
       let statusBadgeEl;
       if(r.statusMasuk==='cuti') statusBadgeEl = el('span',{class:'chip',style:'background:#E8EEFB;color:#2b5a9e;'},['🏖️ Cuti']);
@@ -4734,20 +4850,17 @@ async function renderRekapAbsensi(body){
       if(r.fotoPulang){
         jamPulangCell.appendChild(el('button',{class:'btn btn-outline btn-sm', style:'margin-left:6px;padding:2px 7px;', title:'Lihat foto selfie absen pulang', onclick:()=>showPhotoLightbox(r.fotoPulang, r.nama+' — Absen Pulang '+r.jamPulang+' ('+r.tanggal+')')},['📷']));
       }
-      table.appendChild(el('tr',null,[
+      table.appendChild(el('tr',null,(multi?[el('td',null,[r.tanggal])]:[]).concat([
         el('td',null,[r.nama]), el('td',null,[r.unit]), el('td',null,[r.shiftNama]),
         jamMasukCell, jamPulangCell,
         el('td',null,[fmtDurasi(r.durasi)]),
         el('td',null,[statusBadgeEl]),
-      ]));
+      ])));
     });
     jamResult.appendChild(table);
   }
-  jamSearchInp.addEventListener('input', ()=>{
-    if(!lastJamRows) return;
-    const q = jamSearchInp.value.trim().toLowerCase();
-    renderJamTable(q ? lastJamRows.filter(r=>r.nama.toLowerCase().includes(q)) : lastJamRows);
-  });
+  jamSearchInp.addEventListener('input', ()=>{ if(lastJamRows) renderJamTable(saringJam()); });
+  jamFilter.addEventListener('change', ()=>{ if(lastJamRows) renderJamTable(saringJam()); });
   async function loadJamKedatangan(){
     jamResult.innerHTML = '';
     jamDlBtn.style.display = 'none';
@@ -4756,9 +4869,15 @@ async function renderRekapAbsensi(body){
       return;
     }
     jamResult.appendChild(el('div',{class:'small-note'},['Memuat…']));
-    const dateVal = jamDate.value;
-    const logsMap = await getAbsensiLogsMulti(staffPool.map(p=>p.id), [dateVal]);
-    const rows = await mapLimit(staffPool, 15, async (p)=>{
+    let dAwal = jamDate.value, dAkhir = jamDateEnd.value || jamDate.value;
+    if(!dAwal){ jamResult.innerHTML=''; jamResult.appendChild(el('div',{class:'empty'},['Pilih tanggal dulu.'])); return; }
+    if(dAkhir < dAwal){ const t=dAwal; dAwal=dAkhir; dAkhir=t; jamDate.value=dAwal; jamDateEnd.value=dAkhir; }
+    const tglList = daftarTanggalRentang(dAwal, dAkhir, 62);
+    if(tglList.length===0){ tglList.push(dAwal); }
+    if(((new Date(dAkhir)-new Date(dAwal))/86400000)+1 > 62){ jamResult.innerHTML=''; jamResult.appendChild(el('div',{class:'empty'},['Rentang maksimal 62 hari untuk tampilan ini. Persempit rentang, atau gunakan "Rekap Rentang Tanggal" di bawah.'])); return; }
+    const logsMap = await getAbsensiLogsMulti(staffPool.map(p=>p.id), tglList);
+    const tugas = []; tglList.slice().reverse().forEach(t=>staffPool.forEach(pp=>tugas.push({p:pp,dateVal:t})));
+    const rows = await mapLimit(tugas, 15, async ({p,dateVal})=>{
       const [log, shift] = await Promise.all([Promise.resolve(logsMap['absensi-log:'+p.id+':'+dateVal] || {}), getShiftForDate(p.id, dateVal)]);
       let statusMasuk = '-';
       if(shift.cuti) statusMasuk = 'cuti';
@@ -4775,14 +4894,15 @@ async function renderRekapAbsensi(body){
     lastJamRows = rows;
     jamDlBtn.style.display = '';
     jamSearchInp.value = '';
-    renderJamTable(rows);
+    jamFilter.value = '';
+    renderJamTable(saringJam());
   }
   jamBtn.addEventListener('click', loadJamKedatangan);
   jamDlBtn.addEventListener('click', ()=>{
     if(!lastJamRows) return;
-    const q = jamSearchInp.value.trim().toLowerCase();
-    const rowsToExport = q ? lastJamRows.filter(r=>r.nama.toLowerCase().includes(q)) : lastJamRows;
-    exportJamKedatanganExcel(rowsToExport, jamDate.value, isUnitRole?unitName(state.currentUnitId):'Semua Unit');
+    const rowsToExport = saringJam();
+    const lbl = (jamDateEnd.value && jamDateEnd.value!==jamDate.value) ? jamDate.value+' s.d. '+jamDateEnd.value : jamDate.value;
+    exportJamKedatanganExcel(rowsToExport, lbl, isUnitRole?unitName(state.currentUnitId):'Semua Unit');
   });
   await loadJamKedatangan();
 
@@ -4814,7 +4934,7 @@ async function renderRekapAbsensi(body){
         gabResult.appendChild(el('div',{class:'small-note'},['Memuat…']));
         const dateVal = gabDate.value;
         const [dokterRows] = await Promise.all([getDokterAbsensiUntukTanggal(dateVal)]);
-        const pegawaiRows = (lastJamRows && jamDate.value===dateVal) ? lastJamRows.map(r=>({
+        const pegawaiRows = (lastJamRows && jamDate.value===dateVal && (jamDateEnd.value||jamDate.value)===dateVal) ? lastJamRows.map(r=>({
           jenis:'Pegawai', nama:r.nama, unitKategori:r.unit, jamMasuk:r.jamMasuk, jamPulang:r.jamPulang,
           fotoMasuk:r.fotoMasuk, fotoPulang:r.fotoPulang
         })) : await (async ()=>{
@@ -4869,6 +4989,7 @@ async function renderRekapAbsensi(body){
   rangeRow.appendChild(loadBtn);
   rangeRow.appendChild(dlBtn);
   rangeRow.appendChild(detailDlBtn);
+  panel.appendChild(buatPresetRentang(dStart, dEnd, ()=>loadAndRender()));
   panel.appendChild(rangeRow);
   panel.appendChild(el('div',{class:'small-note',style:'margin-top:-8px;margin-bottom:12px;'},['"Unduh Detail Harian" berisi jam masuk & pulang tiap pegawai untuk SETIAP hari dalam rentang (cocok untuk arsip/lampiran bulanan) — bisa memakan waktu lebih lama untuk rentang panjang atau pegawai banyak.']));
 
@@ -4911,6 +5032,7 @@ async function renderRekapAbsensi(body){
   });
 
   async function loadAndRender(){
+    if(dStart.value && dEnd.value && dEnd.value < dStart.value){ const t=dStart.value; dStart.value=dEnd.value; dEnd.value=t; }
     resultBox.innerHTML = '';
     let doneCount = 0;
     const progressEl = el('div',{class:'small-note'},['Menghitung rekap untuk '+staffPool.length+' pegawai… (0/'+staffPool.length+')']);
@@ -5787,8 +5909,7 @@ function renderRekap(body){
   const table = el('table');
   table.appendChild(el('tr',null,[
     el('th',null,['Nama']),el('th',null,['Unit']),el('th',null,['Sikap']),el('th',null,['Kinerja']),el('th',null,['Mutu']),
-    el('th',null,['Skor Akhir']),el('th',null,['Grade']),el('th',null,['% Tukin']),el('th',null,['Nominal Tukin']),el('th',null,['Status'])
-  ]));
+    el('th',null,['Skor Akhir']),el('th',null,['Grade']),el('th',null,['% Tukin']),el('th',null,['Nominal Tukin']),el('th',null,['Status'])].concat(state.role==='admin'?[el('th',null,['Koreksi'])]:[])));
   if(finalsFiltered.length===0){
     table.appendChild(el('tr',null,[el('td',{colspan:'10',class:'empty'},['Tidak ada pegawai yang cocok dengan pencarian/filter.'])]));
   }
@@ -5804,7 +5925,7 @@ function renderRekap(body){
       el('td',null,[pn.status==='FINAL'? f.tier.persen+'%':'-']),
       el('td',null,[nominal!==null? 'Rp '+nominal.toLocaleString('id-ID'):'-']),
       el('td',null,[statusBadge(pn.status)]),
-    ]));
+    ].concat(state.role==='admin'?[el('td',null,[el('button',{class:'btn btn-outline btn-sm',title:'Koreksi nilai Kinerja & Mutu (Admin)',onclick:()=>bukaKoreksiNilaiAdmin(p)},['✏️ Nilai'])])]:[])));
   });
   panel.appendChild(table);
 
@@ -6409,6 +6530,9 @@ function buildInputPenilaianModal(modal){
   ]));
 
   // Tombol hapus/reset — Admin selalu bisa (untuk semua status); Kepala Unit hanya untuk status yang masih bisa diedit (belum divalidasi).
+  if(state.role==='admin'){
+    modal.appendChild(el('div',{style:'display:flex;justify-content:flex-end;margin-bottom:8px;'},[el('button',{class:'btn btn-gold btn-sm',onclick:()=>bukaKoreksiNilaiAdmin(p)},['✏️ Koreksi Nilai Kinerja & Mutu (Admin)'])]));
+  }
   const canDeletePenilaian = state.role==='admin' || editable;
   if(canDeletePenilaian){
     const delRow = el('div',{style:'display:flex;justify-content:flex-end;margin-bottom:10px;'});
@@ -6637,6 +6761,9 @@ function buildValidasiDiklatModal(modal){
     el('button',{class:'x-btn', onclick:()=>{state.modal=null; rerender();}},['✕'])
   ]));
 
+  if(state.role==='admin'){
+    modal.appendChild(el('div',{style:'display:flex;justify-content:flex-end;margin-bottom:8px;'},[el('button',{class:'btn btn-gold btn-sm',onclick:()=>bukaKoreksiNilaiAdmin(p)},['✏️ Koreksi Nilai (Admin)'])]));
+  }
   modal.appendChild(el('h4',{style:'font-size:13px;margin-bottom:6px;'},['Kinerja Pelayanan']));
   state.aspekConfig.kinerja.forEach(a=>{
     const row = el('div',{class:'score-row'});
