@@ -5868,7 +5868,97 @@ function downloadLaporanMassal(list, periode){
   triggerWordDownload('Laporan-Penilaian-Massal-'+periode.replace(/[^a-zA-Z0-9]+/g,'-')+'.doc', sections);
 }
 
+/* ---- Filter waktu Rekap & Tukin: satu periode (bawaan) atau rentang beberapa periode ---- */
+function bangunFilterWaktuRekap(){
+  const rr = state.rekapRange || (state.rekapRange = {aktif:false, dari:null, sampai:null});
+  const L = state.periodeList;
+  if(!rr.dari || !L.includes(rr.dari)) rr.dari = L[Math.max(0,L.length-3)] || state.periode;
+  if(!rr.sampai || !L.includes(rr.sampai)) rr.sampai = L[L.length-1] || state.periode;
+  const bar = el('div',{class:'panel no-print',style:'border-color:var(--teal);padding:12px 16px;'});
+  const row = el('div',{style:'display:flex;gap:10px;align-items:center;flex-wrap:wrap;'});
+  row.appendChild(el('b',{style:'font-size:13px;'},['🗓️ Filter Waktu:']));
+  const mode = el('select');
+  [['0','Satu periode (ikuti pilihan periode di atas)'],['1','Rentang periode']].forEach(([v,l])=>{ const o=el('option',{value:v},[l]); if((rr.aktif?'1':'0')===v) o.selected=true; mode.appendChild(o); });
+  mode.addEventListener('change', e=>{ rr.aktif = e.target.value==='1'; rerender(); });
+  row.appendChild(mode);
+  if(rr.aktif){
+    const mk = (val,fn)=>{ const sel=el('select'); L.forEach(pr=>{ const o=el('option',{value:pr},[pr]); if(pr===val) o.selected=true; sel.appendChild(o); }); sel.addEventListener('change',e=>{ fn(e.target.value); rerender(); }); return sel; };
+    row.appendChild(el('span',{style:'font-size:12px;color:var(--ink-soft);'},['Dari:']));
+    row.appendChild(mk(rr.dari, v=>{ rr.dari=v; if(L.indexOf(rr.sampai)<L.indexOf(v)) rr.sampai=v; }));
+    row.appendChild(el('span',{style:'font-size:12px;color:var(--ink-soft);'},['s/d']));
+    row.appendChild(mk(rr.sampai, v=>{ rr.sampai=v; if(L.indexOf(rr.dari)>L.indexOf(v)) rr.dari=v; }));
+    [['Semua periode',()=>{rr.dari=L[0]; rr.sampai=L[L.length-1];}],['3 periode terakhir',()=>{rr.dari=L[Math.max(0,L.length-3)]; rr.sampai=L[L.length-1];}],['Tahun ini',()=>{ const th=String(new Date().getFullYear()); const ada=L.filter(x=>x.includes(th)); if(ada.length){rr.dari=ada[0]; rr.sampai=ada[ada.length-1];} }]].forEach(([l,fn])=>{
+      row.appendChild(el('button',{class:'btn btn-outline btn-sm',type:'button',onclick:()=>{ fn(); rerender(); }},[l]));
+    });
+  }
+  bar.appendChild(row);
+  return bar;
+}
+function periodeDalamRentang(){
+  const rr = state.rekapRange, L = state.periodeList;
+  const a = L.indexOf(rr.dari), b = L.indexOf(rr.sampai);
+  return L.slice(Math.min(a,b), Math.max(a,b)+1);
+}
+function hitungRekapRentang(){
+  const daftar = periodeDalamRentang();
+  const rows = state.pegawai.filter(matchesSearchFilter).map(p=>{
+    let total=0, nFinal=0, sumSkor=0; const per={};
+    daftar.forEach(pr=>{
+      const pn = getPenilaian(pr, p.id), f = computeFinal(pn, p.unitId);
+      if(pn.status==='FINAL'){ const nom=Math.round(Number(p.tukin_maks||0)*f.tier.persen/100); per[pr]={nom, skor:f.percent, grade:f.tier.grade}; total+=nom; nFinal++; sumSkor+=f.percent; }
+      else per[pr]={status:pn.status};
+    });
+    return {p, per, total, nFinal, rata: nFinal? sumSkor/nFinal : null};
+  });
+  return {daftar, rows};
+}
+function exportRekapRentangExcel(hasil, label){
+  const {daftar, rows} = hasil;
+  const data = [['REKAP TUKIN PER RENTANG PERIODE — RSU ALLAM MEDICA'],['Rentang: '+label],['Diunduh: '+new Date().toLocaleString('id-ID')],[],
+    ['Nama','Unit'].concat(daftar, ['Jumlah Periode Final','Rata-rata Skor (%)','Total Nominal Tukin'])];
+  rows.forEach(r=>data.push([r.p.nama, unitName(r.p.unitId)].concat(daftar.map(pr=>r.per[pr].nom!=null? r.per[pr].nom : (r.per[pr].status||'-')), [r.nFinal, r.rata!=null? +r.rata.toFixed(1):'', r.total])));
+  const ws = XLSX.utils.aoa_to_sheet(data);
+  ws['!cols'] = [{wch:26},{wch:18}].concat(daftar.map(()=>({wch:16})), [{wch:12},{wch:14},{wch:18}]);
+  const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'Rekap Tukin Rentang');
+  XLSX.writeFile(wb, 'Rekap-Tukin-'+label.replace(/[\s\/]+/g,'-')+'.xlsx');
+}
+function renderRekapRentang(body){
+  const hasil = hitungRekapRentang(), {daftar, rows} = hasil;
+  const label = daftar.length>1 ? daftar[0]+' s.d. '+daftar[daftar.length-1] : daftar[0];
+  const ada = rows.filter(r=>r.nFinal>0);
+  const totalRp = rows.reduce((a,r)=>a+r.total,0);
+  const cards = el('div',{class:'cards-row'});
+  cards.appendChild(el('div',{class:'stat-card'},[el('div',{class:'num'},[String(daftar.length)]), el('div',{class:'lbl'},['Jumlah Periode'])]));
+  cards.appendChild(el('div',{class:'stat-card green'},[el('div',{class:'num'},[String(ada.length)]), el('div',{class:'lbl'},['Pegawai dengan Tukin Final'])]));
+  const rataAll = ada.length? ada.reduce((a,r)=>a+r.rata,0)/ada.length : null;
+  cards.appendChild(el('div',{class:'stat-card gold'},[el('div',{class:'num'},[rataAll!=null? rataAll.toFixed(1)+'%':'-']), el('div',{class:'lbl'},['Rata-rata Skor Final'])]));
+  cards.appendChild(el('div',{class:'stat-card'},[el('div',{class:'num'},['Rp '+Math.round(totalRp).toLocaleString('id-ID')]), el('div',{class:'lbl'},['Total Nominal Tukin (Final)'])]));
+  body.appendChild(cards);
+  const panel = el('div',{class:'panel'});
+  panel.appendChild(el('div',{class:'print-only print-header'},[el('h2',null,['RSU ALLAM MEDICA']), el('div',{class:'sub'},['Rekap Tunjangan Kinerja (Tukin) — '+label]), el('div',{class:'sub'},['Dicetak pada: '+new Date().toLocaleString('id-ID')])]));
+  const head = el('div',{class:'no-print',style:'display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:14px;'});
+  head.appendChild(el('h3',{style:'margin:0;'},['Rekap Tukin — '+label]));
+  const br = el('div',{style:'display:flex;gap:8px;'});
+  br.appendChild(el('button',{class:'btn btn-outline btn-sm',onclick:()=>exportRekapRentangExcel(hasil,label)},['💾 Unduh Excel']));
+  br.appendChild(el('button',{class:'btn btn-gold btn-sm',onclick:()=>window.print()},['🖨️ Cetak']));
+  head.appendChild(br); panel.appendChild(head);
+  panel.appendChild(el('div',{class:'no-print'},[buildSearchFilterBar()]));
+  panel.appendChild(el('div',{class:'small-note',style:'margin-bottom:8px;'},['Nominal hanya dihitung dari penilaian berstatus FINAL; periode yang belum final ditampilkan statusnya.']));
+  const wrap = el('div',{style:'overflow-x:auto;'});
+  const table = el('table');
+  table.appendChild(el('tr',null,[el('th',null,['Nama']),el('th',null,['Unit'])].concat(daftar.map(pr=>el('th',null,[pr])), [el('th',null,['Periode Final']),el('th',null,['Rata-rata Skor']),el('th',null,['Total Nominal'])])));
+  if(rows.length===0) table.appendChild(el('tr',null,[el('td',{colspan:String(5+daftar.length),class:'empty'},['Tidak ada pegawai yang cocok dengan pencarian/filter.'])]));
+  rows.forEach(r=>{
+    table.appendChild(el('tr',null,[el('td',null,[r.p.nama]),el('td',null,[unitName(r.p.unitId)])].concat(
+      daftar.map(pr=>{ const x=r.per[pr]; return el('td',{style:x.nom!=null?'':'color:var(--ink-soft);'},[x.nom!=null? 'Rp '+x.nom.toLocaleString('id-ID') : (STATUS_LABEL_SAFE(x.status)||'-')]); }),
+      [el('td',null,[r.nFinal+'/'+daftar.length]), el('td',null,[r.rata!=null? r.rata.toFixed(1)+'%':'-']), el('td',{style:'font-weight:700;'},[r.nFinal? 'Rp '+r.total.toLocaleString('id-ID'):'-'])])));
+  });
+  wrap.appendChild(table); panel.appendChild(wrap); body.appendChild(panel);
+}
+
 function renderRekap(body){
+  body.appendChild(bangunFilterWaktuRekap());
+  if(state.rekapRange && state.rekapRange.aktif){ renderRekapRentang(body); return; }
   absenSyncBanner(body, state.pegawai, 'all');
   const finals = state.pegawai.map(p=>({p, pn:getPenilaian(state.periode,p.id)}))
     .map(x=>({...x, f:computeFinal(x.pn, x.p.unitId)}));
