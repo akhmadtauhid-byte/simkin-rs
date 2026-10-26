@@ -1784,7 +1784,9 @@ async function computeAttendanceSummary(pegawaiId, startISO, endISO, logsMap){
  *  - Penilaian yang sudah divalidasi HRD / Diklat / Final dikunci — angkanya tidak berubah lagi. */
 const BULAN_ID = {januari:1,jan:1,februari:2,feb:2,maret:3,mar:3,april:4,apr:4,mei:5,juni:6,jun:6,juli:7,jul:7,agustus:8,agu:8,agt:8,agust:8,september:9,sep:9,sept:9,oktober:10,okt:10,november:11,nov:11,nopember:11,desember:12,des:12};
 const ABSEN_AUTO_BEKU = ['VALIDASI_HRD','VALIDASI_DIKLAT','FINAL'];
-function periodeKeRentang(periode){
+function rentangAbsenPeriode(periode){
+  const ov = state.aturanAbsen && state.aturanAbsen.override && state.aturanAbsen.override[periode];
+  if(ov && ov.start && ov.end && ov.start<=ov.end) return {start:ov.start, end:ov.end, manual:true};
   const t = String(periode||'').toLowerCase();
   let bln=null, thn=null, m;
   if((m = t.match(/(\d{4})[-\/](\d{1,2})/))){ thn=+m[1]; bln=+m[2]; }
@@ -1792,15 +1794,16 @@ function periodeKeRentang(periode){
   if(!bln || bln<1 || bln>12 || !thn) return null;
   const pad = n=>String(n).padStart(2,'0');
   const cut = Math.min(28, Math.max(1, Number(state.aturanAbsen && state.aturanAbsen.cutoffMulai) || 1));
-  let start, lastISO;
-  if(cut>1){ /* periode absensi memakai cut-off: mis. periode Oktober = 26 September s/d 25 Oktober */
+  if(cut>1){ /* cut-off: mis. periode Oktober = 26 September s/d 25 Oktober */
     const pb = bln===1 ? 12 : bln-1, pt = bln===1 ? thn-1 : thn;
-    start = pt+'-'+pad(pb)+'-'+pad(cut);
-    lastISO = thn+'-'+pad(bln)+'-'+pad(cut-1);
-  } else {
-    start = thn+'-'+pad(bln)+'-01';
-    lastISO = thn+'-'+pad(bln)+'-'+pad(new Date(Date.UTC(thn, bln, 0)).getUTCDate());
+    return {start: pt+'-'+pad(pb)+'-'+pad(cut), end: thn+'-'+pad(bln)+'-'+pad(cut-1), manual:false};
   }
+  return {start: thn+'-'+pad(bln)+'-01', end: thn+'-'+pad(bln)+'-'+pad(new Date(Date.UTC(thn, bln, 0)).getUTCDate()), manual:false};
+}
+function periodeKeRentang(periode){
+  const full = rentangAbsenPeriode(periode);
+  if(!full) return null;
+  const start = full.start, lastISO = full.end;
   const today = todayISO();
   if(start >= today) return null;                 // periode belum berjalan / baru mulai hari ini: belum ada hari yang bisa dihitung
   const kemarin = isoDateOffset(-1);
@@ -4658,14 +4661,11 @@ async function runAIPenilaianBatch(staffList, narrative, pdfAttachment){
 /* ============ INPUT PENILAIAN (Kepala Unit) ============ */
 /* ============ JADWAL JAGA (kalender shift per hari, per pegawai — untuk shift bergilir/rolling) ============ */
 function labelPeriodeAbsen(periode){
-  const cut = Number(state.aturanAbsen && state.aturanAbsen.cutoffMulai) || 1;
-  const t = String(periode||'').toLowerCase(); let m, bln=null, thn=null;
-  if((m = t.match(/([a-z]+)\D+(\d{4})/))){ bln = BULAN_ID[m[1]]||null; thn=+m[2]; }
-  if(!bln||!thn) return '';
+  const r = rentangAbsenPeriode(periode); if(!r) return '';
   const NM=['Jan','Feb','Mar','Apr','Mei','Jun','Jul','Agu','Sep','Okt','Nov','Des'];
-  if(cut<=1) return '1 '+NM[bln-1]+' – '+new Date(Date.UTC(thn,bln,0)).getUTCDate()+' '+NM[bln-1]+' '+thn;
-  const pb = bln===1?12:bln-1, pt = bln===1?thn-1:thn;
-  return cut+' '+NM[pb-1]+(pt!==thn?' '+pt:'')+' – '+(cut-1)+' '+NM[bln-1]+' '+thn;
+  const f=(iso,dgTahun)=>{ const [y,m,d]=iso.split('-').map(Number); return d+' '+NM[m-1]+(dgTahun?' '+y:''); };
+  const y1=r.start.slice(0,4), y2=r.end.slice(0,4);
+  return f(r.start, y1!==y2)+' – '+f(r.end, true)+(r.manual?' (diubah manual)':'');
 }
 function isoLokal(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
 function rentangPreset(kode){
@@ -5916,8 +5916,33 @@ function bangunFilterWaktuRekap(){
     });
   }
   bar.appendChild(row);
+  const boleh = state.role==='admin' || state.role==='hrd';
+  const tampil = rr.aktif ? periodeDalamRentang() : [state.periode];
+  const box = el('div',{style:'margin-top:10px;display:flex;flex-direction:column;gap:6px;'});
+  box.appendChild(el('div',{style:'font-size:12px;font-weight:700;'},['📅 Rentang tanggal absensi'+(boleh?' (bisa diubah)':'')+':']));
+  tampil.forEach(pr=>{
+    const r = rentangAbsenPeriode(pr); if(!r) return;
+    const line = el('div',{style:'display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12.5px;'});
+    line.appendChild(el('span',{style:'min-width:130px;font-weight:600;'},[pr]));
+    const a = el('input',{type:'date',value:r.start,disabled:!boleh}), b = el('input',{type:'date',value:r.end,disabled:!boleh});
+    const simpan = ()=>{
+      if(!a.value||!b.value) return;
+      let x=a.value, y=b.value; if(y<x){ const t=x; x=y; y=t; }
+      if((new Date(y)-new Date(x))/86400000 > 92){ alert('Rentang absensi satu periode maksimal 92 hari.'); return; }
+      if(!state.aturanAbsen.override) state.aturanAbsen.override = {};
+      state.aturanAbsen.override[pr] = {start:x, end:y, oleh:state.role, pada:new Date().toISOString()};
+      state.absenSync = null; bgSave(saveAbsensiConfig()); rerender();
+    };
+    a.addEventListener('change', simpan); b.addEventListener('change', simpan);
+    line.appendChild(a); line.appendChild(el('span',null,['s/d'])); line.appendChild(b);
+    if(r.manual && boleh) line.appendChild(el('button',{class:'btn btn-outline btn-sm',type:'button',onclick:()=>{ delete state.aturanAbsen.override[pr]; state.absenSync=null; bgSave(saveAbsensiConfig()); rerender(); }},['↺ Kembalikan ke bawaan']));
+    if(r.manual) line.appendChild(el('span',{style:'color:var(--gold);font-weight:600;'},['diubah manual']));
+    box.appendChild(line);
+  });
+  box.appendChild(el('div',{class:'small-note'},['Rentang ini hanya menentukan tanggal absensi yang dihitung untuk periode tersebut (mis. close rekap 26–25). Tukin tetap satu nominal per periode. Penilaian FINAL tidak berubah otomatis — gunakan "Hitung Ulang Tukin dari Kehadiran".']));
+  bar.appendChild(box);
   const cutOn = ((state.aturanAbsen&&state.aturanAbsen.cutoffMulai)||1)>1;
-  bar.appendChild(el('div',{class:'small-note',style:'margin-top:8px;'},[
+  if(false) bar.appendChild(el('div',{class:'small-note',style:'margin-top:8px;'},[
     rr.aktif ? ('Absensi tiap periode dihitung pada jendela: '+periodeDalamRentang().map(pr=>pr+' = '+labelPeriodeAbsen(pr)).join(' · ')+'. Tukin dijumlahkan per periode (satu nominal per periode), bukan per hari.')
              : ('Absensi periode '+state.periode+' dihitung dari '+labelPeriodeAbsen(state.periode)+(cutOn?' (cut-off tanggal '+state.aturanAbsen.cutoffMulai+', atur di Pengaturan → Aturan Kelengkapan Absen).':'.'))]));
   return bar;
